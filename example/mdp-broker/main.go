@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-zeromq/zmq4/majordomo"
+	"github.com/destiny/zmq4/majordomo"
 )
 
 func main() {

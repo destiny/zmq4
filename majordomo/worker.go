@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-zeromq/zmq4"
+	"github.com/destiny/zmq4"
 )
 
 // RequestHandler is a function that processes worker requests

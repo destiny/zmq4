@@ -14,7 +14,7 @@ import (
 	"log"
 	"time"
 
-	zmq "github.com/go-zeromq/zmq4"
+	zmq "github.com/destiny/zmq4"
 )
 
 func main() {

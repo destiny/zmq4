@@ -22,9 +22,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-zeromq/zmq4"
-	"github.com/go-zeromq/zmq4/security/curve"
-	"github.com/go-zeromq/zmq4/majordomo"
+	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/security/curve"
+	"github.com/destiny/zmq4/majordomo"
 )
 
 var (

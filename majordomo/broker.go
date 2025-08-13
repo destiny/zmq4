@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-zeromq/zmq4"
+	"github.com/destiny/zmq4"
 )
 
 // BrokerWorker represents a connected worker from the broker's perspective

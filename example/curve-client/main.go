@@ -11,8 +11,8 @@ import (
 	"log"
 	"os"
 
-	"github.com/go-zeromq/zmq4"
-	"github.com/go-zeromq/zmq4/security/curve"
+	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/security/curve"
 )
 
 func main() {

@@ -1,0 +1,93 @@
+run:
+  timeout: 5m
+  go: '1.23'
+  build-tags:
+    - czmq4
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - typecheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - gocritic
+    - goconst
+    - gocyclo
+    - unparam
+    - unconvert
+    - gomodguard
+    - revive
+    - gosec
+    - exportloopref
+    - nilerr
+    - predeclared
+    - nolintlint
+    - stylecheck
+    - whitespace
+
+linters-settings:
+  gocyclo:
+    min-complexity: 15
+  
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+  
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - experimental
+      - opinionated
+      - performance
+      - style
+    disabled-checks:
+      - dupImport
+      - ifElseChain
+      - octalLiteral
+      - whyNoLint
+  
+  goimports:
+    local-prefixes: github.com/destiny/zmq4
+  
+  gosec:
+    excludes:
+      - G204  # Subprocess launched with variable
+      - G304  # File path provided as tainted input
+  
+  revive:
+    rules:
+      - name: exported
+        disabled: true
+      - name: package-comments
+        disabled: true
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gocritic
+        - gosec
+        - unparam
+    - path: example/
+      linters:
+        - gocritic
+        - gosec
+        - revive
+    - linters:
+        - staticcheck
+      text: "SA1019:" # Ignore deprecation warnings
+  
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true

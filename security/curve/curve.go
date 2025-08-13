@@ -16,7 +16,7 @@ import (
 
 	"golang.org/x/crypto/nacl/box"
 
-	"github.com/go-zeromq/zmq4"
+	"github.com/destiny/zmq4"
 )
 
 const (
