@@ -16,6 +16,9 @@ import (
 
 // clientHandshake performs the CURVE client-side handshake
 func (s *Security) clientHandshake(conn *zmq4.Conn) error {
+	// Initialize handshake state
+	s.handshakeState = HandshakeInit
+	
 	// Step 1: Generate transient key pair for this connection
 	var err error
 	s.clientTransient, err = GenerateKeyPair()
@@ -24,6 +27,7 @@ func (s *Security) clientHandshake(conn *zmq4.Conn) error {
 	}
 	
 	// Step 2: Send HELLO command
+	s.handshakeState = HandshakeHello
 	err = s.sendHello(conn)
 	if err != nil {
 		return fmt.Errorf("curve: failed to send HELLO: %w", err)
@@ -34,8 +38,10 @@ func (s *Security) clientHandshake(conn *zmq4.Conn) error {
 	if err != nil {
 		return fmt.Errorf("curve: failed to receive WELCOME: %w", err)
 	}
+	s.handshakeState = HandshakeWelcome
 	
 	// Step 4: Send INITIATE command
+	s.handshakeState = HandshakeInitiate
 	err = s.sendInitiate(conn)
 	if err != nil {
 		return fmt.Errorf("curve: failed to send INITIATE: %w", err)
@@ -46,17 +52,24 @@ func (s *Security) clientHandshake(conn *zmq4.Conn) error {
 	if err != nil {
 		return fmt.Errorf("curve: failed to receive READY: %w", err)
 	}
+	s.handshakeState = HandshakeReady
 	
+	// Handshake completed successfully
+	s.handshakeState = HandshakeComplete
 	return nil
 }
 
 // serverHandshake performs the CURVE server-side handshake
 func (s *Security) serverHandshake(conn *zmq4.Conn) error {
+	// Initialize handshake state
+	s.handshakeState = HandshakeInit
+	
 	// Step 1: Receive HELLO command
 	err := s.recvHello(conn)
 	if err != nil {
 		return fmt.Errorf("curve: failed to receive HELLO: %w", err)
 	}
+	s.handshakeState = HandshakeHello
 	
 	// Step 2: Generate transient key pair for this connection
 	s.serverTransient, err = GenerateKeyPair()
@@ -65,6 +78,7 @@ func (s *Security) serverHandshake(conn *zmq4.Conn) error {
 	}
 	
 	// Step 3: Send WELCOME command
+	s.handshakeState = HandshakeWelcome
 	err = s.sendWelcome(conn)
 	if err != nil {
 		return fmt.Errorf("curve: failed to send WELCOME: %w", err)
@@ -75,13 +89,17 @@ func (s *Security) serverHandshake(conn *zmq4.Conn) error {
 	if err != nil {
 		return fmt.Errorf("curve: failed to receive INITIATE: %w", err)
 	}
+	s.handshakeState = HandshakeInitiate
 	
 	// Step 5: Send READY command
+	s.handshakeState = HandshakeReady
 	err = s.sendReady(conn)
 	if err != nil {
 		return fmt.Errorf("curve: failed to send READY: %w", err)
 	}
 	
+	// Handshake completed successfully
+	s.handshakeState = HandshakeComplete
 	return nil
 }
 

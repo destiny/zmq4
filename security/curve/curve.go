@@ -202,6 +202,18 @@ func ValidateZ85Key(keyZ85 string) error {
 	return nil
 }
 
+// HandshakeState represents the current state of the CURVE handshake
+type HandshakeState int
+
+const (
+	HandshakeInit     HandshakeState = iota // Initial state, no handshake started
+	HandshakeHello                          // Client has sent HELLO, waiting for WELCOME
+	HandshakeWelcome                        // Server has sent WELCOME, waiting for INITIATE
+	HandshakeInitiate                       // Client has sent INITIATE, waiting for READY
+	HandshakeReady                          // Server has sent READY, handshake complete
+	HandshakeComplete                       // Handshake fully completed, ready for messages
+)
+
 // Security implements the CURVE security mechanism
 type Security struct {
 	keyPair     *KeyPair      // Our permanent key pair
@@ -218,6 +230,9 @@ type Security struct {
 	// Connection state
 	clientNonce uint64
 	serverNonce uint64
+	
+	// Handshake state tracking
+	handshakeState HandshakeState
 	
 	// Shared secrets derived during handshake
 	clientSecret [KeySize]byte // Client -> Server encryption key
@@ -246,6 +261,11 @@ func (s *Security) Type() zmq4.SecurityType {
 	return zmq4.CurveSecurity
 }
 
+// HandshakeState returns the current handshake state
+func (s *Security) HandshakeState() int {
+	return int(s.handshakeState)
+}
+
 // Handshake implements the ZMTP security handshake according to CURVE specification
 func (s *Security) Handshake(conn *zmq4.Conn, server bool) error {
 	if server {
@@ -254,13 +274,18 @@ func (s *Security) Handshake(conn *zmq4.Conn, server bool) error {
 	return s.clientHandshake(conn)
 }
 
-// Encrypt writes the encrypted form of data to w
+// Encrypt writes the encrypted form of data to w (for MESSAGE commands only)
 func (s *Security) Encrypt(w io.Writer, data []byte) (int, error) {
 	return s.EncryptWithFlags(w, data, false)
 }
 
-// EncryptWithFlags writes the encrypted form of data to w with continuation support
+// EncryptWithFlags writes the encrypted form of data to w with continuation support (for MESSAGE commands only)
 func (s *Security) EncryptWithFlags(w io.Writer, data []byte, hasMore bool) (int, error) {
+	// Only allow MESSAGE encryption after handshake is complete
+	if s.handshakeState != HandshakeComplete {
+		return 0, fmt.Errorf("curve: message encryption only allowed after handshake completion, current state: %d", s.handshakeState)
+	}
+	
 	// CURVE MESSAGE format per RFC 26: [flags][nonce][box]
 	// flags: 1 byte (0x00 for final message, 0x01 for more messages coming)
 	// nonce: 8 bytes (little-endian counter)
@@ -272,7 +297,7 @@ func (s *Security) EncryptWithFlags(w io.Writer, data []byte, hasMore bool) (int
 	// Determine which keys to use based on our role
 	var recipientKey, senderKey *[KeySize]byte
 	if s.clientTransient == nil || s.serverTransient == nil {
-		return 0, fmt.Errorf("curve: handshake not completed")
+		return 0, fmt.Errorf("curve: transient keys not available for message encryption")
 	}
 	
 	if s.isServer {
@@ -309,14 +334,19 @@ func (s *Security) EncryptWithFlags(w io.Writer, data []byte, hasMore bool) (int
 	return w.Write(msg)
 }
 
-// Decrypt writes the decrypted form of data to w
+// Decrypt writes the decrypted form of data to w (for MESSAGE commands only)
 func (s *Security) Decrypt(w io.Writer, data []byte) (int, error) {
 	n, _, err := s.DecryptWithFlags(w, data)
 	return n, err
 }
 
-// DecryptWithFlags decrypts data and returns the number of bytes written, continuation flag, and error
+// DecryptWithFlags decrypts data and returns the number of bytes written, continuation flag, and error (for MESSAGE commands only)
 func (s *Security) DecryptWithFlags(w io.Writer, data []byte) (int, bool, error) {
+	// Only allow MESSAGE decryption after handshake is complete
+	if s.handshakeState != HandshakeComplete {
+		return 0, false, fmt.Errorf("curve: message decryption only allowed after handshake completion, current state: %d", s.handshakeState)
+	}
+	
 	if len(data) < 1+8+BoxOverhead {
 		return 0, false, ErrInvalidCommand
 	}
@@ -341,7 +371,7 @@ func (s *Security) DecryptWithFlags(w io.Writer, data []byte) (int, bool, error)
 	// Determine which keys to use based on our role
 	var senderKey, recipientKey *[KeySize]byte
 	if s.clientTransient == nil || s.serverTransient == nil {
-		return 0, false, fmt.Errorf("curve: handshake not completed")
+		return 0, false, fmt.Errorf("curve: transient keys not available for message decryption")
 	}
 	
 	if s.isServer {
@@ -429,6 +459,94 @@ func (s *Security) nextServerNonce() [NonceSize]byte {
 	copy(nonce[8:], "CurveZMQMESSAGE-")
 	
 	return nonce
+}
+
+// EncryptHandshakeCommand encrypts a handshake command based on current handshake state
+func (s *Security) EncryptHandshakeCommand(w io.Writer, command string, data []byte) (int, error) {
+	switch command {
+	case "HELLO":
+		return s.encryptHello(w, data)
+	case "WELCOME":
+		return s.encryptWelcome(w, data)
+	case "INITIATE":
+		return s.encryptInitiate(w, data)
+	case "READY":
+		return s.encryptReady(w, data)
+	default:
+		return 0, fmt.Errorf("curve: unknown handshake command: %s", command)
+	}
+}
+
+// DecryptHandshakeCommand decrypts a handshake command based on current handshake state
+func (s *Security) DecryptHandshakeCommand(w io.Writer, command string, data []byte) (int, error) {
+	switch command {
+	case "HELLO":
+		return s.decryptHello(w, data)
+	case "WELCOME":
+		return s.decryptWelcome(w, data)
+	case "INITIATE":
+		return s.decryptInitiate(w, data)
+	case "READY":
+		return s.decryptReady(w, data)
+	default:
+		return 0, fmt.Errorf("curve: unknown handshake command: %s", command)
+	}
+}
+
+// encryptHello encrypts HELLO command (client side)
+// HELLO is sent in plain text according to RFC 26/CurveZMQ - no encryption needed
+func (s *Security) encryptHello(w io.Writer, data []byte) (int, error) {
+	// HELLO command is sent in plain text per RFC 26
+	return w.Write(data)
+}
+
+// decryptHello decrypts HELLO command (server side)
+// HELLO is received in plain text according to RFC 26/CurveZMQ - no decryption needed
+func (s *Security) decryptHello(w io.Writer, data []byte) (int, error) {
+	// HELLO command is received in plain text per RFC 26
+	return w.Write(data)
+}
+
+// encryptWelcome encrypts WELCOME command (server side)
+// WELCOME is sent in plain text according to RFC 26/CurveZMQ - no encryption needed
+func (s *Security) encryptWelcome(w io.Writer, data []byte) (int, error) {
+	// WELCOME command is sent in plain text per RFC 26
+	return w.Write(data)
+}
+
+// decryptWelcome decrypts WELCOME command (client side)
+// WELCOME is received in plain text according to RFC 26/CurveZMQ - no decryption needed
+func (s *Security) decryptWelcome(w io.Writer, data []byte) (int, error) {
+	// WELCOME command is received in plain text per RFC 26
+	return w.Write(data)
+}
+
+// encryptInitiate encrypts INITIATE command (client side)  
+// INITIATE is sent in plain text according to RFC 26/CurveZMQ - no encryption needed
+func (s *Security) encryptInitiate(w io.Writer, data []byte) (int, error) {
+	// INITIATE command is sent in plain text per RFC 26
+	return w.Write(data)
+}
+
+// decryptInitiate decrypts INITIATE command (server side)
+// INITIATE is received in plain text according to RFC 26/CurveZMQ - no decryption needed
+func (s *Security) decryptInitiate(w io.Writer, data []byte) (int, error) {
+	// INITIATE command is received in plain text per RFC 26
+	return w.Write(data)
+}
+
+// encryptReady encrypts READY command (server side)
+// READY is sent in plain text according to RFC 26/CurveZMQ - no encryption needed
+func (s *Security) encryptReady(w io.Writer, data []byte) (int, error) {
+	// READY command is sent in plain text per RFC 26
+	return w.Write(data)
+}
+
+// decryptReady decrypts READY command (client side)
+// READY is received in plain text according to RFC 26/CurveZMQ - no decryption needed
+func (s *Security) decryptReady(w io.Writer, data []byte) (int, error) {
+	// READY command is received in plain text per RFC 26
+	return w.Write(data)
 }
 
 var (

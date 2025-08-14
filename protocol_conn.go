@@ -169,7 +169,77 @@ func (c *Conn) SendCmd(name string, body []byte) error {
 	if err != nil {
 		return err
 	}
-	return c.send(true, buf, 0)
+	return c.sendCmd(name, buf)
+}
+
+// sendCmd handles command sending with appropriate encryption based on security mechanism
+func (c *Conn) sendCmd(cmdName string, body []byte) error {
+	// Check if this is a CURVE handshake command that needs special handling
+	if c.sec.Type() == CurveSecurity {
+		if isCurveHandshakeCommand(cmdName) {
+			// Use handshake-specific encryption for CURVE handshake commands
+			if curveSec, ok := c.sec.(interface {
+				EncryptHandshakeCommand(w io.Writer, command string, data []byte) (int, error)
+			}); ok {
+				return c.sendWithCurveHandshakeEncryption(curveSec, cmdName, body)
+			}
+		}
+	}
+	
+	// Use regular send for all other commands and messages
+	return c.send(true, body, 0)
+}
+
+// isCurveHandshakeCommand checks if a command is part of the CURVE handshake
+func isCurveHandshakeCommand(cmdName string) bool {
+	switch cmdName {
+	case CmdHello, CmdWelcome, CmdInitiate, CmdReady:
+		return true
+	default:
+		return false
+	}
+}
+
+// sendWithCurveHandshakeEncryption sends a CURVE handshake command with proper encryption
+func (c *Conn) sendWithCurveHandshakeEncryption(curveSec interface {
+	EncryptHandshakeCommand(w io.Writer, command string, data []byte) (int, error)
+}, cmdName string, body []byte) error {
+	// Long flag
+	size := len(body)
+	isLong := size > 255
+	flag := byte(0)
+	if isLong {
+		flag ^= isLongBitFlag
+	}
+
+	// Command flag
+	flag ^= isCommandBitFlag
+
+	var (
+		hdr = [8 + 1]byte{flag}
+		hsz int
+	)
+
+	// Write out the message header
+	if isLong {
+		hsz = 9
+		binary.BigEndian.PutUint64(hdr[1:], uint64(size))
+	} else {
+		hsz = 2
+		hdr[1] = uint8(size)
+	}
+	if _, err := c.rw.Write(hdr[:hsz]); err != nil {
+		c.checkIO(err)
+		return err
+	}
+
+	// Use CURVE handshake-specific encryption
+	if _, err := curveSec.EncryptHandshakeCommand(c.rw, cmdName, body); err != nil {
+		c.checkIO(err)
+		return err
+	}
+
+	return nil
 }
 
 // SendMsg sends a ZMTP message over the wire.
@@ -366,6 +436,25 @@ func (c *Conn) send(isCommand bool, body []byte, flag byte) error {
 	return nil
 }
 
+// isCurveHandshake checks if the CURVE handshake is still in progress
+func (c *Conn) isCurveHandshake() bool {
+	if c.sec.Type() != CurveSecurity {
+		return false
+	}
+	
+	// Check if this is a CURVE security mechanism with handshake state tracking
+	if curveSec, ok := c.sec.(interface {
+		HandshakeState() int // We'll need to add this method to curve.Security
+	}); ok {
+		state := curveSec.HandshakeState()
+		// HandshakeComplete = 5, so anything less means handshake is in progress
+		return state < 5
+	}
+	
+	// Fallback: assume handshake is in progress if we can't determine state
+	return true
+}
+
 // read returns the isCommand flag, the body of the message, and optionally an error
 func (c *Conn) read() Msg {
 	var (
@@ -425,6 +514,14 @@ func (c *Conn) read() Msg {
 		case NullSecurity: // FIXME(sbinet): also do that for non-encrypted PLAIN?
 			msg.Frames = append(msg.Frames, body)
 			continue
+		case CurveSecurity:
+			// For CURVE, check if this might be a handshake command
+			if isCmd && c.isCurveHandshake() {
+				// CURVE handshake commands are sent in plain text
+				msg.Frames = append(msg.Frames, body)
+				continue
+			}
+			// Fall through to regular decryption for MESSAGE commands
 		}
 
 		buf := new(bytes.Buffer)

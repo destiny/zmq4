@@ -48,6 +48,109 @@ func TestSecurityType(t *testing.T) {
 	}
 }
 
+func TestHandshakeState(t *testing.T) {
+	serverKeys, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("Failed to generate server keys: %v", err)
+	}
+	
+	clientKeys, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("Failed to generate client keys: %v", err)
+	}
+	
+	// Test client security handshake state
+	clientSec := NewClientSecurity(clientKeys, serverKeys.Public)
+	if clientSec.HandshakeState() != 0 { // HandshakeInit = 0
+		t.Errorf("Client initial handshake state should be 0, got %d", clientSec.HandshakeState())
+	}
+	
+	// Test server security handshake state  
+	serverSec := NewServerSecurity(serverKeys)
+	if serverSec.HandshakeState() != 0 { // HandshakeInit = 0
+		t.Errorf("Server initial handshake state should be 0, got %d", serverSec.HandshakeState())
+	}
+}
+
+func TestMessageEncryptionBeforeHandshake(t *testing.T) {
+	serverKeys, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("Failed to generate server keys: %v", err)
+	}
+	
+	clientKeys, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("Failed to generate client keys: %v", err)
+	}
+	
+	// Create client security but don't complete handshake
+	clientSec := NewClientSecurity(clientKeys, serverKeys.Public)
+	
+	// Try to encrypt a message before handshake completion - should fail
+	var buf bytes.Buffer
+	testData := []byte("test message")
+	
+	_, err = clientSec.Encrypt(&buf, testData)
+	if err == nil {
+		t.Error("Expected error when encrypting before handshake completion, but got none")
+	}
+	
+	if !strings.Contains(err.Error(), "message encryption only allowed after handshake completion") {
+		t.Errorf("Expected handshake completion error, got: %v", err)
+	}
+}
+
+func TestHandshakeCommandEncryption(t *testing.T) {
+	serverKeys, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("Failed to generate server keys: %v", err)
+	}
+	
+	clientKeys, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("Failed to generate client keys: %v", err)
+	}
+	
+	clientSec := NewClientSecurity(clientKeys, serverKeys.Public)
+	
+	// Test handshake command encryption (should work even before handshake)
+	var buf bytes.Buffer
+	testHelloData := []byte("HELLO command data")
+	
+	_, err = clientSec.EncryptHandshakeCommand(&buf, "HELLO", testHelloData)
+	if err != nil {
+		t.Errorf("Handshake command encryption should work before handshake: %v", err)
+	}
+	
+	// Verify data was written (for HELLO it should be plain text)
+	if !bytes.Equal(buf.Bytes(), testHelloData) {
+		t.Error("HELLO command should be written as plain text")
+	}
+}
+
+func TestHandshakeCommandDecryption(t *testing.T) {
+	serverKeys, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("Failed to generate server keys: %v", err)
+	}
+	
+	serverSec := NewServerSecurity(serverKeys)
+	
+	// Test handshake command decryption
+	var buf bytes.Buffer
+	testHelloData := []byte("HELLO command data")
+	
+	_, err = serverSec.DecryptHandshakeCommand(&buf, "HELLO", testHelloData)
+	if err != nil {
+		t.Errorf("Handshake command decryption should work: %v", err)
+	}
+	
+	// Verify data was written (for HELLO it should be plain text)
+	if !bytes.Equal(buf.Bytes(), testHelloData) {
+		t.Error("HELLO command should be read as plain text")
+	}
+}
+
 func TestClientServerSecurity(t *testing.T) {
 	// Generate key pairs
 	serverKeys, err := GenerateKeyPair()
@@ -136,11 +239,13 @@ func TestEncryptDecrypt(t *testing.T) {
 	serverSec := NewServerSecurity(serverKeys)
 	serverSec.clientTransient, _ = GenerateKeyPair()
 	serverSec.serverTransient, _ = GenerateKeyPair()
+	serverSec.handshakeState = HandshakeComplete // Simulate completed handshake
 	
 	clientSec := NewClientSecurity(clientKeys, serverKeys.Public)
 	// Use the same transient keys so they can communicate
 	clientSec.clientTransient = serverSec.clientTransient
 	clientSec.serverTransient = serverSec.serverTransient
+	clientSec.handshakeState = HandshakeComplete // Simulate completed handshake
 	
 	// Test message to encrypt
 	message := []byte("Hello, CURVE ZMQ!")
