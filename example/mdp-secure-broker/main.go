@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Example Majordomo broker
+// Example Majordomo broker with CURVE security
 package main
 
 import (
@@ -17,22 +17,31 @@ import (
 )
 
 func main() {
-	// Create broker with default options (no security)
-	options := majordomo.DefaultBrokerOptions()
-	options.HeartbeatLiveness = 3
-	options.HeartbeatInterval = 2500 * time.Millisecond
-	options.RequestTimeout = 30 * time.Second
-	options.LogInfo = true
+	// Generate server key pair for CURVE security
+	serverKeys, err := majordomo.GenerateCURVEKeys()
+	if err != nil {
+		log.Fatalf("Failed to generate server keys: %v", err)
+	}
 	
-	broker := majordomo.NewBroker("tcp://*:5555", options)
+	// Display server public key for clients
+	pubZ85, _ := serverKeys.PublicKeyZ85()
+	log.Printf("Server public key (Z85): %s", pubZ85)
+	log.Printf("Server public key (hex): %x", serverKeys.Public)
+	log.Printf("Clients need this server public key to connect securely")
+	
+	// Create secure broker with CURVE security
+	broker, err := majordomo.NewBrokerWithCURVE("tcp://*:5555", serverKeys, nil)
+	if err != nil {
+		log.Fatalf("Failed to create secure broker: %v", err)
+	}
 	
 	// Start broker
-	err := broker.Start()
+	err = broker.Start()
 	if err != nil {
 		log.Fatalf("Failed to start broker: %v", err)
 	}
 	
-	log.Printf("Majordomo broker started on tcp://*:5555")
+	log.Printf("Secure Majordomo broker started on tcp://*:5555")
 	
 	// Set up signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -65,5 +74,5 @@ func main() {
 		log.Printf("Error stopping broker: %v", err)
 	}
 	
-	log.Printf("Broker stopped")
+	log.Printf("Secure broker stopped")
 }

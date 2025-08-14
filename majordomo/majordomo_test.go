@@ -152,7 +152,7 @@ func TestInvalidMessageParsing(t *testing.T) {
 
 func TestBrokerBasicOperations(t *testing.T) {
 	// Test broker creation
-	broker := NewBroker("tcp://127.0.0.1:5555")
+	broker := NewBroker("tcp://127.0.0.1:5555", nil)
 	if broker == nil {
 		t.Fatal("Failed to create broker")
 	}
@@ -326,7 +326,7 @@ func TestIntegration(t *testing.T) {
 	endpoint := "tcp://127.0.0.1:15555"
 	
 	// Start broker
-	broker := NewBroker(endpoint)
+	broker := NewBroker(endpoint, nil)
 	err := broker.Start()
 	if err != nil {
 		t.Fatalf("Failed to start broker: %v", err)

@@ -22,6 +22,7 @@ type WorkerOptions struct {
 	HeartbeatLiveness int           // Heartbeat liveness factor
 	HeartbeatInterval time.Duration // Heartbeat interval
 	ReconnectInterval time.Duration // Reconnection interval
+	Security          zmq4.Security // Security mechanism (nil for no security)
 	LogErrors         bool          // Whether to log errors
 	LogInfo           bool          // Whether to log info messages
 }
@@ -32,6 +33,7 @@ func DefaultWorkerOptions() *WorkerOptions {
 		HeartbeatLiveness: DefaultHeartbeatLiveness,
 		HeartbeatInterval: DefaultHeartbeatInterval,
 		ReconnectInterval: 2500 * time.Millisecond,
+		Security:          nil,
 		LogErrors:         true,
 		LogInfo:           false,
 	}
@@ -180,8 +182,13 @@ func (w *Worker) connectToBroker() {
 		w.socket.Close()
 	}
 	
-	// Create new DEALER socket
-	socket := zmq4.NewDealer(w.ctx)
+	// Create new DEALER socket with security if configured
+	var socket zmq4.Socket
+	if w.options.Security != nil {
+		socket = zmq4.NewDealer(w.ctx, zmq4.WithSecurity(w.options.Security))
+	} else {
+		socket = zmq4.NewDealer(w.ctx)
+	}
 	
 	err := socket.Dial(w.brokerEndpoint)
 	if err != nil {

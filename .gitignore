@@ -1,0 +1,79 @@
+# Compiled binaries (executable files)
+# Go builds produce binaries with no extension on Unix-like systems
+# and .exe extension on Windows
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build artifacts
+*.o
+*.a
+*.out
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Go mod download cache
+go.sum
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go binary executables (only in root directory to avoid ignoring source directories)
+/mdp-broker
+/mdp-client  
+/mdp-worker
+/mdp-secure-broker
+/mdp-secure-client
+/mdp-secure-worker
+/curve-server
+/curve-client
+/hwserver
+/hwclient
+/psenvpub
+/psenvsub
+/rrclient
+/rrworker
+/rtdealer
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Coverage files
+coverage.txt
+coverage.html
+coverage.out
+
+# Profiling files
+*.prof
+*.pprof
+
+# Debug files
+debug
+debug.test

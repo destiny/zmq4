@@ -57,6 +57,28 @@ func (r *PendingRequest) IsExpired(ttl time.Duration) bool {
 	return time.Since(r.Created) > ttl
 }
 
+// BrokerOptions configures MDP broker behavior
+type BrokerOptions struct {
+	HeartbeatLiveness int           // Heartbeat liveness factor
+	HeartbeatInterval time.Duration // Heartbeat interval
+	RequestTimeout    time.Duration // Request timeout
+	Security          zmq4.Security // Security mechanism (nil for no security)
+	LogErrors         bool          // Whether to log errors
+	LogInfo           bool          // Whether to log info messages
+}
+
+// DefaultBrokerOptions returns default broker options
+func DefaultBrokerOptions() *BrokerOptions {
+	return &BrokerOptions{
+		HeartbeatLiveness: DefaultHeartbeatLiveness,
+		HeartbeatInterval: DefaultHeartbeatInterval,
+		RequestTimeout:    30 * time.Second,
+		Security:          nil,
+		LogErrors:         true,
+		LogInfo:           false,
+	}
+}
+
 // Broker implements the MDP broker
 type Broker struct {
 	// Configuration
@@ -65,6 +87,7 @@ type Broker struct {
 	heartbeatInterval time.Duration
 	heartbeatExpiry   time.Duration
 	requestTimeout    time.Duration
+	options           *BrokerOptions
 	
 	// Networking
 	socket zmq4.Socket
@@ -92,15 +115,20 @@ type Broker struct {
 }
 
 // NewBroker creates a new MDP broker
-func NewBroker(endpoint string) *Broker {
+func NewBroker(endpoint string, options *BrokerOptions) *Broker {
+	if options == nil {
+		options = DefaultBrokerOptions()
+	}
+	
 	ctx, cancel := context.WithCancel(context.Background())
 	
 	return &Broker{
 		endpoint:          endpoint,
-		heartbeatLiveness: DefaultHeartbeatLiveness,
-		heartbeatInterval: DefaultHeartbeatInterval,
-		heartbeatExpiry:   DefaultHeartbeatExpiry,
-		requestTimeout:    30 * time.Second,
+		heartbeatLiveness: options.HeartbeatLiveness,
+		heartbeatInterval: options.HeartbeatInterval,
+		heartbeatExpiry:   options.HeartbeatInterval * time.Duration(options.HeartbeatLiveness),
+		requestTimeout:    options.RequestTimeout,
+		options:           options,
 		ctx:               ctx,
 		cancel:            cancel,
 		services:          make(map[ServiceName]*Service),
@@ -140,8 +168,13 @@ func (b *Broker) Start() error {
 		return fmt.Errorf("mdp: broker already running")
 	}
 	
-	// Create router socket
-	socket := zmq4.NewRouter(b.ctx)
+	// Create router socket with security if configured
+	var socket zmq4.Socket
+	if b.options.Security != nil {
+		socket = zmq4.NewRouter(b.ctx, zmq4.WithSecurity(b.options.Security))
+	} else {
+		socket = zmq4.NewRouter(b.ctx)
+	}
 	
 	err := socket.Listen(b.endpoint)
 	if err != nil {
@@ -156,7 +189,13 @@ func (b *Broker) Start() error {
 	go b.messageLoop()
 	go b.cleanupLoop()
 	
-	log.Printf("MDP broker started on %s", b.endpoint)
+	if b.options.LogInfo {
+		if b.options.Security != nil {
+			log.Printf("MDP broker started on %s with %s security", b.endpoint, b.options.Security.Type())
+		} else {
+			log.Printf("MDP broker started on %s", b.endpoint)
+		}
+	}
 	return nil
 }
 
@@ -180,7 +219,9 @@ func (b *Broker) Stop() error {
 		}
 	}
 	
-	log.Printf("MDP broker stopped")
+	if b.options.LogInfo {
+		log.Printf("MDP broker stopped")
+	}
 	return nil
 }
 
@@ -193,7 +234,7 @@ func (b *Broker) messageLoop() {
 		default:
 			msg, err := b.socket.Recv()
 			if err != nil {
-				if b.running {
+				if b.running && b.options.LogErrors {
 					log.Printf("MDP broker recv error: %v", err)
 				}
 				continue
@@ -267,7 +308,9 @@ func (b *Broker) processWorkerMessage(identity []byte, frames [][]byte) {
 			// Add to service
 			b.addWorkerToService(worker)
 			
-			log.Printf("MDP broker: worker %x registered for service %s", identity, workerMsg.Service)
+			if b.options.LogInfo {
+				log.Printf("MDP broker: worker %x registered for service %s", identity, workerMsg.Service)
+			}
 		}
 		
 	case WorkerReply:
@@ -334,7 +377,9 @@ func (b *Broker) processClientMessage(identity []byte, frames [][]byte) {
 	// Try to dispatch immediately
 	b.dispatchRequests(service)
 	
-	log.Printf("MDP broker: request from client %x for service %s", identity, clientMsg.Service)
+	if b.options.LogInfo {
+		log.Printf("MDP broker: request from client %x for service %s", identity, clientMsg.Service)
+	}
 }
 
 // sendToWorker sends a message to a worker
@@ -431,7 +476,9 @@ func (b *Broker) dispatchRequests(service *Service) {
 		// Send request to worker
 		b.sendToWorker(worker.Identity, WorkerRequest, request.Client, request.Body)
 		
-		log.Printf("MDP broker: dispatched request to worker %x for service %s", worker.Identity, service.Name)
+			if b.options.LogInfo {
+			log.Printf("MDP broker: dispatched request to worker %x for service %s", worker.Identity, service.Name)
+		}
 	}
 }
 
@@ -459,7 +506,9 @@ func (b *Broker) disconnectWorker(worker *BrokerWorker, send bool) {
 		}
 	}
 	
-	log.Printf("MDP broker: disconnected worker %x from service %s", worker.Identity, worker.Service)
+	if b.options.LogInfo {
+		log.Printf("MDP broker: disconnected worker %x from service %s", worker.Identity, worker.Service)
+	}
 }
 
 // heartbeatLoop sends periodic heartbeats to workers
@@ -528,7 +577,9 @@ func (b *Broker) cleanup() {
 				}
 			}
 			
-			log.Printf("MDP broker: expired worker %x from service %s", worker.Identity, worker.Service)
+			if b.options.LogInfo {
+				log.Printf("MDP broker: expired worker %x from service %s", worker.Identity, worker.Service)
+			}
 		}
 	}
 	
@@ -539,7 +590,9 @@ func (b *Broker) cleanup() {
 			if !request.IsExpired(b.requestTimeout) {
 				validRequests = append(validRequests, request)
 			} else {
-				log.Printf("MDP broker: expired request from client %x for service %s", request.Client, request.Service)
+				if b.options.LogInfo {
+					log.Printf("MDP broker: expired request from client %x for service %s", request.Client, request.Service)
+				}
 			}
 		}
 		service.Requests = validRequests

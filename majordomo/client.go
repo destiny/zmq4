@@ -18,6 +18,7 @@ import (
 type ClientOptions struct {
 	Timeout   time.Duration // Request timeout
 	Retries   int           // Number of retries
+	Security  zmq4.Security // Security mechanism (nil for no security)
 	LogErrors bool          // Whether to log errors
 }
 
@@ -26,6 +27,7 @@ func DefaultClientOptions() *ClientOptions {
 	return &ClientOptions{
 		Timeout:   30 * time.Second,
 		Retries:   3,
+		Security:  nil,
 		LogErrors: true,
 	}
 }
@@ -76,8 +78,13 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("mdp: client already connected")
 	}
 	
-	// Create REQ socket for synchronous client
-	socket := zmq4.NewReq(c.ctx)
+	// Create REQ socket for synchronous client with security if configured
+	var socket zmq4.Socket
+	if c.options.Security != nil {
+		socket = zmq4.NewReq(c.ctx, zmq4.WithSecurity(c.options.Security))
+	} else {
+		socket = zmq4.NewReq(c.ctx)
+	}
 	
 	err := socket.Dial(c.brokerEndpoint)
 	if err != nil {
@@ -233,8 +240,13 @@ func (c *Client) reconnect() {
 		c.socket.Close()
 	}
 	
-	// Create new socket
-	socket := zmq4.NewReq(c.ctx)
+	// Create new socket with security if configured
+	var socket zmq4.Socket
+	if c.options.Security != nil {
+		socket = zmq4.NewReq(c.ctx, zmq4.WithSecurity(c.options.Security))
+	} else {
+		socket = zmq4.NewReq(c.ctx)
+	}
 	err := socket.Dial(c.brokerEndpoint)
 	if err != nil {
 		if c.options.LogErrors {
@@ -331,8 +343,13 @@ func (c *AsyncClient) Connect() error {
 		return fmt.Errorf("mdp: async client already connected")
 	}
 	
-	// Create DEALER socket for asynchronous client
-	socket := zmq4.NewDealer(c.ctx)
+	// Create DEALER socket for asynchronous client with security if configured
+	var socket zmq4.Socket
+	if c.options.Security != nil {
+		socket = zmq4.NewDealer(c.ctx, zmq4.WithSecurity(c.options.Security))
+	} else {
+		socket = zmq4.NewDealer(c.ctx)
+	}
 	
 	err := socket.Dial(c.brokerEndpoint)
 	if err != nil {
