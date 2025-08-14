@@ -20,8 +20,14 @@ func main() {
 		log.Fatalf("Failed to generate server keys: %v", err)
 	}
 	
-	log.Printf("Server public key: %x", serverKeys.Public)
-	log.Printf("Server secret key: %x", serverKeys.Secret)
+	// Display keys in both hex and Z85 formats
+	pubZ85, _ := serverKeys.PublicKeyZ85()
+	secZ85, _ := serverKeys.SecretKeyZ85()
+	
+	log.Printf("Server public key (hex): %x", serverKeys.Public)
+	log.Printf("Server public key (Z85): %s", pubZ85)
+	log.Printf("Server secret key (hex): %x", serverKeys.Secret)
+	log.Printf("Server secret key (Z85): %s", secZ85)
 	
 	// Create CURVE security for server
 	security := curve.NewServerSecurity(serverKeys)
@@ -39,7 +45,8 @@ func main() {
 	}
 	
 	log.Printf("CURVE server listening on tcp://*:5555")
-	log.Printf("Clients need server public key: %x", serverKeys.Public)
+	log.Printf("Clients need server public key (hex): %x", serverKeys.Public)
+	log.Printf("Clients need server public key (Z85): %s", pubZ85)
 	
 	for {
 		// Receive request

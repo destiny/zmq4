@@ -10,6 +10,7 @@ package curve
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"golang.org/x/crypto/nacl/box"
 
 	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/z85"
 )
 
 const (
@@ -99,6 +101,105 @@ func NewKeyPair(public, secret [KeySize]byte) *KeyPair {
 		Public: public,
 		Secret: secret,
 	}
+}
+
+// PublicKeyZ85 returns the public key encoded as Z85 string
+func (kp *KeyPair) PublicKeyZ85() (string, error) {
+	return z85.EncodeToString(kp.Public[:])
+}
+
+// SecretKeyZ85 returns the secret key encoded as Z85 string
+func (kp *KeyPair) SecretKeyZ85() (string, error) {
+	return z85.EncodeToString(kp.Secret[:])
+}
+
+// PublicKeyHex returns the public key encoded as hex string
+func (kp *KeyPair) PublicKeyHex() string {
+	return hex.EncodeToString(kp.Public[:])
+}
+
+// SecretKeyHex returns the secret key encoded as hex string
+func (kp *KeyPair) SecretKeyHex() string {
+	return hex.EncodeToString(kp.Secret[:])
+}
+
+// NewKeyPairFromZ85 creates a key pair from Z85-encoded public and secret keys
+func NewKeyPairFromZ85(publicZ85, secretZ85 string) (*KeyPair, error) {
+	// Decode public key
+	publicBytes, err := z85.DecodeString(publicZ85)
+	if err != nil {
+		return nil, fmt.Errorf("curve: invalid public key Z85 encoding: %w", err)
+	}
+	if len(publicBytes) != KeySize {
+		return nil, fmt.Errorf("curve: public key must be %d bytes, got %d", KeySize, len(publicBytes))
+	}
+
+	// Decode secret key
+	secretBytes, err := z85.DecodeString(secretZ85)
+	if err != nil {
+		return nil, fmt.Errorf("curve: invalid secret key Z85 encoding: %w", err)
+	}
+	if len(secretBytes) != KeySize {
+		return nil, fmt.Errorf("curve: secret key must be %d bytes, got %d", KeySize, len(secretBytes))
+	}
+
+	var public, secret [KeySize]byte
+	copy(public[:], publicBytes)
+	copy(secret[:], secretBytes)
+
+	return &KeyPair{
+		Public: public,
+		Secret: secret,
+	}, nil
+}
+
+// NewKeyPairFromHex creates a key pair from hex-encoded public and secret keys
+func NewKeyPairFromHex(publicHex, secretHex string) (*KeyPair, error) {
+	// Decode public key
+	publicBytes, err := hex.DecodeString(publicHex)
+	if err != nil {
+		return nil, fmt.Errorf("curve: invalid public key hex encoding: %w", err)
+	}
+	if len(publicBytes) != KeySize {
+		return nil, fmt.Errorf("curve: public key must be %d bytes, got %d", KeySize, len(publicBytes))
+	}
+
+	// Decode secret key
+	secretBytes, err := hex.DecodeString(secretHex)
+	if err != nil {
+		return nil, fmt.Errorf("curve: invalid secret key hex encoding: %w", err)
+	}
+	if len(secretBytes) != KeySize {
+		return nil, fmt.Errorf("curve: secret key must be %d bytes, got %d", KeySize, len(secretBytes))
+	}
+
+	var public, secret [KeySize]byte
+	copy(public[:], publicBytes)
+	copy(secret[:], secretBytes)
+
+	return &KeyPair{
+		Public: public,
+		Secret: secret,
+	}, nil
+}
+
+// ValidateZ85Key validates that a string is a valid Z85-encoded CURVE key
+func ValidateZ85Key(keyZ85 string) error {
+	if err := z85.ValidateString(keyZ85); err != nil {
+		return fmt.Errorf("curve: invalid Z85 key format: %w", err)
+	}
+	
+	// Check that it decodes to the correct key size
+	keyBytes, err := z85.DecodeString(keyZ85)
+	if err != nil {
+		return fmt.Errorf("curve: Z85 key decode error: %w", err)
+	}
+	
+	if len(keyBytes) != KeySize {
+		return fmt.Errorf("curve: Z85 key must decode to %d bytes, got %d", KeySize, len(keyBytes))
+	}
+	
+	return nil
 }
 
 // Security implements the CURVE security mechanism

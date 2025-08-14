@@ -1069,7 +1069,41 @@ func TestCURVECompatibilityEdgeCases(t *testing.T) {
 			t.Fatalf("Failed to generate keys: %v", err)
 		}
 
-		// Test Z85 encoding compatibility (if implemented)
+		// Test Z85 encoding compatibility
+		pubZ85, err := keys.PublicKeyZ85()
+		if err != nil {
+			t.Fatalf("Failed to encode public key as Z85: %v", err)
+		}
+		
+		secZ85, err := keys.SecretKeyZ85()
+		if err != nil {
+			t.Fatalf("Failed to encode secret key as Z85: %v", err)
+		}
+		
+		// Verify Z85 encoded keys are correct length (40 chars for 32 bytes)
+		if len(pubZ85) != 40 {
+			t.Errorf("Z85 public key should be 40 characters, got %d", len(pubZ85))
+		}
+		
+		if len(secZ85) != 40 {
+			t.Errorf("Z85 secret key should be 40 characters, got %d", len(secZ85))
+		}
+		
+		// Test Z85 roundtrip
+		keysFromZ85, err := curve.NewKeyPairFromZ85(pubZ85, secZ85)
+		if err != nil {
+			t.Fatalf("Failed to recreate keys from Z85: %v", err)
+		}
+		
+		if !bytesEqual(keys.Public[:], keysFromZ85.Public[:]) {
+			t.Error("Z85 public key roundtrip failed")
+		}
+		
+		if !bytesEqual(keys.Secret[:], keysFromZ85.Secret[:]) {
+			t.Error("Z85 secret key roundtrip failed")
+		}
+
+		// Test hex encoding for comparison
 		pubHex := hex.EncodeToString(keys.Public[:])
 		secHex := hex.EncodeToString(keys.Secret[:])
 
@@ -1098,6 +1132,12 @@ func TestCURVECompatibilityEdgeCases(t *testing.T) {
 		if !bytesEqual(pubBytes, pubBytesUpper) {
 			t.Error("Uppercase hex decoding mismatch")
 		}
+		
+		// Log comparison between formats
+		t.Logf("Key format comparison:")
+		t.Logf("  Hex (64 chars): %s", pubHex)
+		t.Logf("  Z85 (40 chars): %s", pubZ85)
+		t.Logf("  Z85 is %d%% more compact", 100*(64-40)/64)
 	})
 
 	t.Run("Large-Message-Handling", func(t *testing.T) {
