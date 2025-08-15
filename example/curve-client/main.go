@@ -11,8 +11,8 @@ import (
 	"log"
 	"os"
 
-	"github.com/destiny/zmq4"
-	"github.com/destiny/zmq4/security/curve"
+	"github.com/destiny/zmq4/v25"
+	"github.com/destiny/zmq4/v25/security/curve"
 )
 
 // isHex checks if a string contains only hexadecimal characters

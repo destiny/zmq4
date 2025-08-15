@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/v25"
 )
 
 // security implements the PLAIN security mechanism.

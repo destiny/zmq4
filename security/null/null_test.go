@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/destiny/zmq4"
-	"github.com/destiny/zmq4/security/null"
+	"github.com/destiny/zmq4/v25"
+	"github.com/destiny/zmq4/v25/security/null"
 	"golang.org/x/sync/errgroup"
 )
 

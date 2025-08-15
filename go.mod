@@ -1,4 +1,4 @@
-module github.com/destiny/zmq4
+module github.com/destiny/zmq4/v25
 
 go 1.23.0
 

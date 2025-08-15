@@ -7,8 +7,8 @@ package majordomo
 import (
 	"fmt"
 
-	"github.com/destiny/zmq4"
-	"github.com/destiny/zmq4/security/curve"
+	"github.com/destiny/zmq4/v25"
+	"github.com/destiny/zmq4/v25/security/curve"
 )
 
 // CURVESecurityConfig holds CURVE security configuration

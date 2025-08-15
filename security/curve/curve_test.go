@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/v25"
 )
 
 func TestKeyPairGeneration(t *testing.T) {

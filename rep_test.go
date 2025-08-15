@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/v25"
 )
 
 func TestIssue99(t *testing.T) {

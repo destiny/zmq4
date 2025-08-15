@@ -4,7 +4,7 @@
 
 // Package transport defines the Transport interface and provides a net-based
 // implementation that can be used by zmq4 sockets to exchange messages.
-package transport // import "github.com/destiny/zmq4/transport"
+package transport // import "github.com/destiny/zmq4/v25/transport"
 
 import (
 	"context"

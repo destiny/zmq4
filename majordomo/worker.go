@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/v25"
 )
 
 // RequestHandler is a function that processes worker requests

@@ -10,7 +10,7 @@ package zmq4_test
 import (
 	"context"
 
-	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/v25"
 )
 
 var (

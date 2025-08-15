@@ -8,7 +8,7 @@ import (
 	"context"
 	"net"
 
-	"github.com/destiny/zmq4/transport"
+	"github.com/destiny/zmq4/v25/transport"
 )
 
 // Transport implements the zmq4 Transport interface for the inproc transport.

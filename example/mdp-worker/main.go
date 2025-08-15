@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/destiny/zmq4/majordomo"
+	"github.com/destiny/zmq4/v25/majordomo"
 )
 
 func main() {

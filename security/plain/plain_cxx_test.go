@@ -16,8 +16,8 @@ import (
 	"time"
 
 	czmq4 "github.com/go-zeromq/goczmq/v4"
-	"github.com/destiny/zmq4"
-	"github.com/destiny/zmq4/security/plain"
+	"github.com/destiny/zmq4/v25"
+	"github.com/destiny/zmq4/v25/security/plain"
 	"golang.org/x/sync/errgroup"
 )
 

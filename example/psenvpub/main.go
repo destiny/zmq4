@@ -13,7 +13,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/v25"
 )
 
 func main() {

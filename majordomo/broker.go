@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/v25"
 )
 
 // Message type constants for frame analysis

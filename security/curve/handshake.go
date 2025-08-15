@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/crypto/nacl/box"
 
-	"github.com/destiny/zmq4"
+	"github.com/destiny/zmq4/v25"
 )
 
 // clientHandshake performs the CURVE client-side handshake

@@ -12,8 +12,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/destiny/zmq4/majordomo"
-	"github.com/destiny/zmq4/security/curve"
+	"github.com/destiny/zmq4/v25/majordomo"
+	"github.com/destiny/zmq4/v25/security/curve"
 )
 
 // isHex checks if a string contains only hexadecimal characters
