@@ -14,6 +14,13 @@ import (
 	"github.com/destiny/zmq4"
 )
 
+// Message type constants for frame analysis
+const (
+	messageTypeUnknown = iota
+	messageTypeWorker
+	messageTypeClient
+)
+
 // BrokerWorker represents a connected worker from the broker's perspective
 type BrokerWorker struct {
 	ID       WorkerID
@@ -256,19 +263,181 @@ func (b *Broker) processMessage(msg zmq4.Msg) {
 	// First frame is sender identity
 	sender := frames[0]
 	
+	// Debug: log frame structure
+	if b.options.LogInfo {
+		log.Printf("MDP broker: received %d frames from %x", len(frames), sender)
+		for i, frame := range frames {
+			if len(frame) > 0 {
+				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
+	
 	if len(frames) < 3 {
 		log.Printf("MDP broker: message too short from %x", sender)
 		return
 	}
 	
-	// Check if this is a worker or client message
-	if len(frames) >= 2 && string(frames[2]) == WorkerProtocol {
-		b.processWorkerMessage(sender, frames[1:])
-	} else if len(frames) >= 2 && string(frames[2]) == ClientProtocol {
-		b.processClientMessage(sender, frames[1:])
-	} else {
-		log.Printf("MDP broker: unknown protocol from %x", sender)
+	// Analyze message structure using frame separator detection
+	msgType, protocolFrame, messageFrames := b.analyzeMessageStructure(frames, sender)
+	
+	if msgType == messageTypeUnknown {
+		return // Error already logged in analyzeMessageStructure
 	}
+	
+	if string(protocolFrame) == WorkerProtocol {
+		if b.options.LogInfo {
+			log.Printf("MDP broker: → processing worker message from %x", sender)
+		}
+		b.processWorkerMessage(sender, messageFrames)
+	} else if string(protocolFrame) == ClientProtocol {
+		if b.options.LogInfo {
+			log.Printf("MDP broker: → processing client message from %x", sender)
+		}
+		b.processClientMessage(sender, messageFrames)
+	} else {
+		log.Printf("MDP broker: unknown protocol %q from %x", string(protocolFrame), sender)
+	}
+}
+
+// analyzeMessageStructure analyzes frame structure using separator detection
+// Returns: messageType, protocolFrame, messageFrames
+func (b *Broker) analyzeMessageStructure(frames [][]byte, sender []byte) (int, []byte, [][]byte) {
+	if len(frames) < 2 {
+		if b.options.LogErrors {
+			log.Printf("MDP broker: insufficient frames from %x", sender)
+		}
+		return messageTypeUnknown, nil, nil
+	}
+	
+	// Skip identity frame (first frame from ROUTER socket)
+	workingFrames := frames[1:]
+	
+	// Debug logging if enabled
+	if b.options.LogInfo {
+		log.Printf("MDP broker: analyzing %d frames from %x", len(frames), sender)
+		for i, frame := range frames {
+			if len(frame) > 0 {
+				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
+	
+	// Find empty frame separators
+	separatorIndices := []int{}
+	for i, frame := range workingFrames {
+		if len(frame) == 0 {
+			separatorIndices = append(separatorIndices, i)
+		}
+	}
+	
+	// Analyze separator patterns to detect message type
+	return b.detectMessageTypeFromSeparators(workingFrames, separatorIndices, sender)
+}
+
+// detectMessageTypeFromSeparators uses separator patterns to identify message structure
+func (b *Broker) detectMessageTypeFromSeparators(workingFrames [][]byte, separatorIndices []int, sender []byte) (int, []byte, [][]byte) {
+	if len(workingFrames) < 2 {
+		if b.options.LogErrors {
+			log.Printf("MDP broker: insufficient working frames from %x", sender)
+		}
+		return messageTypeUnknown, nil, nil
+	}
+	
+	// Pattern 1: Worker message [empty][protocol][command][...]
+	// This has exactly one separator at the beginning
+	if len(separatorIndices) >= 1 && separatorIndices[0] == 0 {
+		if len(workingFrames) >= 2 && len(workingFrames[1]) > 0 {
+			protocolFrame := workingFrames[1]
+			if string(protocolFrame) == WorkerProtocol {
+				if b.options.LogInfo {
+					log.Printf("MDP broker: detected worker message from %x", sender)
+				}
+				return messageTypeWorker, protocolFrame, workingFrames
+			}
+		}
+	}
+	
+	// Pattern 2: Client message - scan for protocol after separators
+	// Client messages may have multiple separators: [empty...][protocol][service][body...]
+	if len(separatorIndices) > 0 {
+		// Look for protocol frame after the last separator
+		lastSeparatorIdx := separatorIndices[len(separatorIndices)-1]
+		
+		// Scan frames after last separator for protocol
+		for i := lastSeparatorIdx + 1; i < len(workingFrames); i++ {
+			if len(workingFrames[i]) > 0 {
+				protocolFrame := workingFrames[i]
+				if string(protocolFrame) == ClientProtocol {
+					if b.options.LogInfo {
+						log.Printf("MDP broker: detected client message from %x", sender)
+					}
+					// For client parsing, we need [empty][protocol][service][body...]
+					// Find the separator immediately before the protocol frame
+					protocolStartIdx := i - 1
+					if protocolStartIdx >= 0 && len(workingFrames[protocolStartIdx]) == 0 {
+						return messageTypeClient, protocolFrame, workingFrames[protocolStartIdx:]
+					} else {
+						// No empty frame before protocol, create the expected structure
+						clientFrames := [][]byte{{}} // Start with empty frame
+						clientFrames = append(clientFrames, workingFrames[i:]...) // Add protocol and rest
+						return messageTypeClient, protocolFrame, clientFrames
+					}
+				}
+				// If we find a non-empty frame that's not a protocol, this isn't a valid message
+				break
+			}
+		}
+	}
+	
+	// Pattern 3: Fallback - scan all frames for protocols (handles unknown separator patterns)
+	for i, frame := range workingFrames {
+		if len(frame) > 0 {
+			frameStr := string(frame)
+			if frameStr == WorkerProtocol {
+				if b.options.LogInfo {
+					log.Printf("MDP broker: detected worker message (fallback) from %x", sender)
+				}
+				// For worker, we need the empty frame before protocol
+				if i > 0 {
+					return messageTypeWorker, frame, workingFrames[i-1:]
+				} else {
+					return messageTypeWorker, frame, workingFrames
+				}
+			} else if frameStr == ClientProtocol {
+				if b.options.LogInfo {
+					log.Printf("MDP broker: detected client message (fallback) from %x", sender)
+				}
+				// For client, find the separator before protocol
+				for j := i - 1; j >= 0; j-- {
+					if len(workingFrames[j]) == 0 {
+						return messageTypeClient, frame, workingFrames[j:]
+					}
+				}
+				// No separator found, use from beginning
+				return messageTypeClient, frame, workingFrames
+			}
+		}
+	}
+	
+	// Unable to detect message type
+	if b.options.LogErrors {
+		log.Printf("MDP broker: unrecognized message format from %x", sender)
+		log.Printf("  separators at indices: %v", separatorIndices)
+		for i, frame := range workingFrames {
+			if len(frame) > 0 {
+				log.Printf("  working_frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  working_frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
+	
+	return messageTypeUnknown, nil, nil
 }
 
 // processWorkerMessage processes a message from a worker
@@ -314,12 +483,21 @@ func (b *Broker) processWorkerMessage(identity []byte, frames [][]byte) {
 		}
 		
 	case WorkerReply:
+		if b.options.LogInfo {
+			log.Printf("MDP broker: ← received REPLY from worker %x", identity)
+		}
 		if !exists {
 			// Unknown worker - disconnect
+			if b.options.LogErrors {
+				log.Printf("MDP broker: unknown worker %x sent reply - disconnecting", identity)
+			}
 			b.sendToWorker(identity, WorkerDisconnect, nil, nil)
 		} else {
-			// Forward reply to client
-			b.sendToClient(workerMsg.ClientAddr, workerMsg.Service, workerMsg.Body)
+			if b.options.LogInfo {
+				log.Printf("MDP broker: forwarding reply from worker %x to client %x", identity, workerMsg.ClientAddr)
+			}
+			// Forward reply to client (use worker's service, not message service)
+			b.sendToClient(workerMsg.ClientAddr, worker.Service, workerMsg.Body)
 			worker.LastSeen = time.Now()
 			worker.Expiry = time.Now().Add(b.heartbeatExpiry)
 			worker.RequestsProcessed++
@@ -327,6 +505,9 @@ func (b *Broker) processWorkerMessage(identity []byte, frames [][]byte) {
 			
 			// Worker is now available for more requests
 			b.addWorkerToWaiting(worker)
+			if b.options.LogInfo {
+				log.Printf("MDP broker: worker %x now available for more requests", identity)
+			}
 		}
 		
 	case WorkerHeartbeat:
@@ -384,37 +565,72 @@ func (b *Broker) processClientMessage(identity []byte, frames [][]byte) {
 
 // sendToWorker sends a message to a worker
 func (b *Broker) sendToWorker(identity []byte, command string, clientAddr []byte, body []byte) {
+	if b.options.LogInfo {
+		log.Printf("MDP broker: → sending %s (0x%02x) to worker %x", command, []byte(command)[0], identity)
+	}
+	
 	msg := NewWorkerMessage(command, clientAddr, body)
 	frames := msg.FormatWorkerMessage()
 	
-	// Prepend worker identity
+	// Prepend worker identity for ROUTER socket routing
 	allFrames := make([][]byte, 0, len(frames)+1)
 	allFrames = append(allFrames, identity)
 	allFrames = append(allFrames, frames...)
+	
+	if b.options.LogInfo && command == WorkerRequest {
+		log.Printf("MDP broker: sending %d frames to worker:", len(allFrames))
+		for i, frame := range allFrames {
+			if len(frame) > 0 {
+				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
 	
 	zmqMsg := zmq4.NewMsgFrom(allFrames...)
 	
 	err := b.socket.Send(zmqMsg)
 	if err != nil {
 		log.Printf("MDP broker: failed to send to worker %x: %v", identity, err)
+	} else if b.options.LogInfo {
+		log.Printf("MDP broker: ✓ sent %s (0x%02x) to worker %x", command, []byte(command)[0], identity)
 	}
 }
 
 // sendToClient sends a message to a client
 func (b *Broker) sendToClient(identity []byte, service ServiceName, body []byte) {
+	if b.options.LogInfo {
+		log.Printf("MDP broker: → sending reply to client %x for service %s", identity, service)
+	}
+	
 	msg := NewClientReply(service, body)
 	frames := msg.FormatClientReply()
 	
-	// Prepend client identity
-	allFrames := make([][]byte, 0, len(frames)+1)
+	// For ROUTER->REQ communication, prepend identity and empty frame for routing
+	allFrames := make([][]byte, 0, len(frames)+2)
 	allFrames = append(allFrames, identity)
+	allFrames = append(allFrames, []byte{}) // Empty frame separator
 	allFrames = append(allFrames, frames...)
 	
 	zmqMsg := zmq4.NewMsgFrom(allFrames...)
 	
+	if b.options.LogInfo {
+		log.Printf("MDP broker: sending %d frames to client:", len(allFrames))
+		for i, frame := range allFrames {
+			if len(frame) > 0 {
+				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
+	
 	err := b.socket.Send(zmqMsg)
 	if err != nil {
 		log.Printf("MDP broker: failed to send to client %x: %v", identity, err)
+	} else if b.options.LogInfo {
+		log.Printf("MDP broker: ✓ sent reply to client %x", identity)
 	}
 }
 

@@ -218,6 +218,38 @@ func (w *Worker) processMessages() {
 	ticker := time.NewTicker(100 * time.Millisecond) // Check timeout frequently
 	defer ticker.Stop()
 	
+	// Create a single message channel for the socket reader
+	msgCh := make(chan zmq4.Msg, 10)
+	errCh := make(chan error, 1)
+	
+	// Start single reader goroutine
+	go func() {
+		for {
+			select {
+			case <-w.stopCh:
+				return
+			default:
+				msg, err := w.socket.Recv()
+				if err != nil {
+					select {
+					case errCh <- err:
+					case <-w.stopCh:
+						return
+					}
+				} else {
+					if w.options.LogInfo {
+						log.Printf("MDP worker: socket received %d frames", len(msg.Frames))
+					}
+					select {
+					case msgCh <- msg:
+					case <-w.stopCh:
+						return
+					}
+				}
+			}
+		}
+	}()
+	
 	for {
 		select {
 		case <-w.stopCh:
@@ -238,50 +270,39 @@ func (w *Worker) processMessages() {
 				return
 			}
 			
-		default:
-			// Try to receive message with short timeout
-			ctx, cancel := context.WithTimeout(w.ctx, 100*time.Millisecond)
-			
-			msg, err := w.recvMessage(ctx)
-			cancel()
-			
-			if err != nil {
-				continue // Timeout or other error, continue loop
-			}
-			
+		case msg := <-msgCh:
 			w.processMessage(msg)
+			
+		case err := <-errCh:
+			if w.options.LogErrors {
+				log.Printf("MDP worker: socket error: %v", err)
+			}
+			// Socket error - reconnect
+			w.disconnect()
+			return
+			
+		default:
+			// Non-blocking continue to check other cases
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
 
-// recvMessage receives a message from the broker
-func (w *Worker) recvMessage(ctx context.Context) (zmq4.Msg, error) {
-	// Use a goroutine to make Recv cancellable
-	msgCh := make(chan zmq4.Msg, 1)
-	errCh := make(chan error, 1)
-	
-	go func() {
-		msg, err := w.socket.Recv()
-		if err != nil {
-			errCh <- err
-		} else {
-			msgCh <- msg
-		}
-	}()
-	
-	select {
-	case msg := <-msgCh:
-		return msg, nil
-	case err := <-errCh:
-		return zmq4.Msg{}, err
-	case <-ctx.Done():
-		return zmq4.Msg{}, ctx.Err()
-	}
-}
 
 // processMessage processes a single message from the broker
 func (w *Worker) processMessage(msg zmq4.Msg) {
 	frames := msg.Frames
+	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: received %d frames from broker:", len(frames))
+		for i, frame := range frames {
+			if len(frame) > 0 {
+				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
 	
 	// Reset liveness - broker is alive
 	w.mu.Lock()
@@ -294,6 +315,10 @@ func (w *Worker) processMessage(msg zmq4.Msg) {
 			log.Printf("MDP worker: invalid message from broker: %v", err)
 		}
 		return
+	}
+	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: received command 0x%02x from broker", []byte(workerMsg.Command)[0])
 	}
 	
 	switch workerMsg.Command {
@@ -311,13 +336,17 @@ func (w *Worker) processMessage(msg zmq4.Msg) {
 		
 	default:
 		if w.options.LogErrors {
-			log.Printf("MDP worker: unknown command from broker: %s", workerMsg.Command)
+			log.Printf("MDP worker: unknown command from broker: 0x%02x", []byte(workerMsg.Command)[0])
 		}
 	}
 }
 
 // processRequest processes a request from a client
 func (w *Worker) processRequest(workerMsg *Message) {
+	if w.options.LogInfo {
+		log.Printf("MDP worker: ← received REQUEST from client %x (len=%d)", workerMsg.ClientAddr, len(workerMsg.Body))
+	}
+	
 	if w.expectReply {
 		if w.options.LogErrors {
 			log.Printf("MDP worker: received request while expecting reply")
@@ -346,6 +375,10 @@ func (w *Worker) processRequest(workerMsg *Message) {
 		reply = []byte(fmt.Sprintf("Error: %v", err))
 	}
 	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: processed request, reply ready (len=%d)", len(reply))
+	}
+	
 	// Send reply
 	w.sendReply(reply)
 }
@@ -362,6 +395,10 @@ func (w *Worker) sendReply(reply []byte) {
 		return
 	}
 	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: → sending reply to client %x (len=%d)", w.replyTo, len(reply))
+	}
+	
 	w.sendToBroker(WorkerReply, w.replyTo, reply)
 	
 	w.expectReply = false
@@ -371,6 +408,10 @@ func (w *Worker) sendReply(reply []byte) {
 
 // sendToBroker sends a message to the broker
 func (w *Worker) sendToBroker(command string, clientAddr []byte, body []byte) {
+	if w.options.LogInfo && command == WorkerReply {
+		log.Printf("MDP worker: → sending %s to broker for client %x", command, clientAddr)
+	}
+	
 	msg := NewWorkerMessage(command, clientAddr, body)
 	
 	// For READY messages, the service should be in the Service field, not Body
@@ -389,6 +430,8 @@ func (w *Worker) sendToBroker(command string, clientAddr []byte, body []byte) {
 			log.Printf("MDP worker: failed to send %s to broker: %v", command, err)
 		}
 		w.liveness--
+	} else if w.options.LogInfo && command == WorkerReply {
+		log.Printf("MDP worker: ✓ sent %s to broker", command)
 	}
 }
 

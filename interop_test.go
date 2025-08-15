@@ -304,8 +304,11 @@ func testMDPBasicRequestReply(t *testing.T) {
 	endpoint := mustInterop(EndPointInterop("tcp"))
 	defer cleanUpInterop(endpoint)
 
-	// Create and start broker
-	broker := majordomo.NewBroker(endpoint)
+	// Create and start broker with logging enabled
+	brokerOpts := majordomo.DefaultBrokerOptions()
+	brokerOpts.LogInfo = true
+	brokerOpts.LogErrors = true
+	broker := majordomo.NewBroker(endpoint, brokerOpts)
 	err := broker.Start()
 	if err != nil {
 		t.Fatalf("Failed to start broker: %v", err)
@@ -320,7 +323,10 @@ func testMDPBasicRequestReply(t *testing.T) {
 		return []byte("Echo: " + string(request)), nil
 	}
 	
-	worker, err := majordomo.NewWorker("echo.service", endpoint, handler, nil)
+	workerOpts := majordomo.DefaultWorkerOptions()
+	workerOpts.LogInfo = true
+	workerOpts.LogErrors = true
+	worker, err := majordomo.NewWorker("echo.service", endpoint, handler, workerOpts)
 	if err != nil {
 		t.Fatalf("Failed to create worker: %v", err)
 	}
@@ -335,7 +341,9 @@ func testMDPBasicRequestReply(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// Create client and send request
-	client := majordomo.NewClient(endpoint, nil)
+	clientOpts := majordomo.DefaultClientOptions()
+	clientOpts.LogErrors = true
+	client := majordomo.NewClient(endpoint, clientOpts)
 	err = client.Connect()
 	if err != nil {
 		t.Fatalf("Failed to connect client: %v", err)
@@ -364,7 +372,7 @@ func testMDPMultipleWorkers(t *testing.T) {
 	defer cleanUpInterop(endpoint)
 
 	// Create and start broker
-	broker := majordomo.NewBroker(endpoint)
+	broker := majordomo.NewBroker(endpoint, nil)
 	err := broker.Start()
 	if err != nil {
 		t.Fatalf("Failed to start broker: %v", err)
@@ -439,7 +447,7 @@ func testMDPWorkerHeartbeat(t *testing.T) {
 	defer cleanUpInterop(endpoint)
 
 	// Create and start broker
-	broker := majordomo.NewBroker(endpoint)
+	broker := majordomo.NewBroker(endpoint, nil)
 	err := broker.Start()
 	if err != nil {
 		t.Fatalf("Failed to start broker: %v", err)
@@ -503,7 +511,7 @@ func testMDPServiceDiscovery(t *testing.T) {
 	defer cleanUpInterop(endpoint)
 
 	// Create and start broker
-	broker := majordomo.NewBroker(endpoint)
+	broker := majordomo.NewBroker(endpoint, nil)
 	err := broker.Start()
 	if err != nil {
 		t.Fatalf("Failed to start broker: %v", err)
@@ -572,7 +580,7 @@ func testMDPErrorHandling(t *testing.T) {
 	defer cleanUpInterop(endpoint)
 
 	// Create and start broker
-	broker := majordomo.NewBroker(endpoint)
+	broker := majordomo.NewBroker(endpoint, nil)
 	err := broker.Start()
 	if err != nil {
 		t.Fatalf("Failed to start broker: %v", err)
@@ -636,7 +644,7 @@ func testMDPLoadBalancing(t *testing.T) {
 	defer cleanUpInterop(endpoint)
 
 	// Create and start broker
-	broker := majordomo.NewBroker(endpoint)
+	broker := majordomo.NewBroker(endpoint, nil)
 	err := broker.Start()
 	if err != nil {
 		t.Fatalf("Failed to start broker: %v", err)

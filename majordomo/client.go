@@ -219,6 +219,17 @@ func (c *Client) doRequest(service ServiceName, request []byte) ([]byte, error) 
 
 // processReply processes a reply message
 func (c *Client) processReply(msg zmq4.Msg, expectedService ServiceName) ([]byte, error) {
+	if c.options.LogErrors {
+		log.Printf("MDP client: received %d frames:", len(msg.Frames))
+		for i, frame := range msg.Frames {
+			if len(frame) > 0 {
+				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
+	
 	reply, err := ParseClientMessage(msg.Frames)
 	if err != nil {
 		return nil, fmt.Errorf("mdp: invalid reply message: %w", err)

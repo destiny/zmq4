@@ -140,9 +140,8 @@ func (m *Message) FormatClientRequest() [][]byte {
 
 // FormatClientReply formats a message as a client REPLY
 func (m *Message) FormatClientReply() [][]byte {
-	// CLIENT REPLY: [empty][protocol][service][body...]
+	// CLIENT REPLY: [protocol][service][body...] (no empty frame for REQ socket)
 	frames := [][]byte{
-		{}, // Empty frame
 		[]byte(ClientProtocol),
 		[]byte(m.Service),
 	}
@@ -203,21 +202,32 @@ func (m *Message) FormatWorkerMessage() [][]byte {
 
 // ParseClientMessage parses frames as a client protocol message
 func ParseClientMessage(frames [][]byte) (*Message, error) {
-	if len(frames) < 3 {
+	// For replies from broker to REQ socket: [protocol][service][body...]
+	// For requests from REQ socket: [empty][protocol][service][body...]
+	
+	var protocolIdx, serviceIdx, bodyIdx int
+	
+	// Check if this is a reply (no empty frame) or request (has empty frame)
+	if len(frames) >= 3 && len(frames[0]) == 0 {
+		// Request format: [empty][protocol][service][body...]
+		protocolIdx, serviceIdx, bodyIdx = 1, 2, 3
+	} else if len(frames) >= 2 {
+		// Reply format: [protocol][service][body...]
+		protocolIdx, serviceIdx, bodyIdx = 0, 1, 2
+	} else {
 		return nil, fmt.Errorf("mdp: client message too short: %d frames", len(frames))
 	}
 	
-	// Check empty frame
-	if len(frames[0]) != 0 {
-		return nil, fmt.Errorf("mdp: client message missing empty frame")
-	}
-	
 	// Check protocol
-	if string(frames[1]) != ClientProtocol {
-		return nil, fmt.Errorf("mdp: invalid client protocol: %s", string(frames[1]))
+	if string(frames[protocolIdx]) != ClientProtocol {
+		return nil, fmt.Errorf("mdp: invalid client protocol: %s", string(frames[protocolIdx]))
 	}
 	
-	service := ServiceName(frames[2])
+	if serviceIdx >= len(frames) {
+		return nil, fmt.Errorf("mdp: client message missing service")
+	}
+	
+	service := ServiceName(frames[serviceIdx])
 	if err := service.Validate(); err != nil {
 		return nil, fmt.Errorf("mdp: %w", err)
 	}
@@ -229,8 +239,8 @@ func ParseClientMessage(frames [][]byte) (*Message, error) {
 	}
 	
 	// Extract body if present
-	if len(frames) > 3 {
-		msg.Body = frames[3]
+	if bodyIdx < len(frames) {
+		msg.Body = frames[bodyIdx]
 	}
 	
 	return msg, nil
