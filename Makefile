@@ -26,6 +26,16 @@ test-coverage: ## Run tests with coverage
 	go test -race -coverprofile=coverage.out -covermode=atomic $(TAGS) ./...
 	go tool cover -html=coverage.out -o coverage.html
 
+test-pebbe: ## Run head-to-head tests against pebbe/zmq4 (requires libzmq)
+	go test $(GOFLAGS) -tags=pebbe ./security/curve -run TestCURVE.*Interop
+
+test-signature-fix: ## Test the signature box fix with fresh keys
+	go test $(GOFLAGS) $(TAGS) . -run TestCURVESignatureBoxFix
+
+test-interop: ## Run all interoperability tests (czmq4 + pebbe)
+	go test $(GOFLAGS) $(TAGS) . -run TestCURVEInterop
+	go test $(GOFLAGS) -tags=pebbe ./security/curve -run TestCURVE.*Interop
+
 bench: ## Run benchmarks
 	go test -bench=. -benchmem $(TAGS) ./...
 
