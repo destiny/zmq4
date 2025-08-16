@@ -302,7 +302,38 @@ func (b *Broker) processMessage(msg zmq4.Msg) {
 	}
 }
 
-// analyzeMessageStructure analyzes frame structure using separator detection
+// splitOnSeparators splits frames into parts using empty frames as separators
+// Returns array of frame parts, with empty separators removed
+func (b *Broker) splitOnSeparators(frames [][]byte) [][][]byte {
+	if len(frames) == 0 {
+		return nil
+	}
+	
+	var parts [][][]byte
+	var currentPart [][]byte
+	
+	for _, frame := range frames {
+		if len(frame) == 0 {
+			// Empty frame is a separator
+			if len(currentPart) > 0 {
+				parts = append(parts, currentPart)
+				currentPart = nil
+			}
+		} else {
+			// Non-empty frame goes into current part
+			currentPart = append(currentPart, frame)
+		}
+	}
+	
+	// Add final part if it exists
+	if len(currentPart) > 0 {
+		parts = append(parts, currentPart)
+	}
+	
+	return parts
+}
+
+// analyzeMessageStructure analyzes frame structure using separator-based splitting
 // Returns: messageType, protocolFrame, messageFrames
 func (b *Broker) analyzeMessageStructure(frames [][]byte, sender []byte) (int, []byte, [][]byte) {
 	if len(frames) < 2 {
@@ -327,20 +358,12 @@ func (b *Broker) analyzeMessageStructure(frames [][]byte, sender []byte) (int, [
 		}
 	}
 	
-	// Find empty frame separators
-	separatorIndices := []int{}
-	for i, frame := range workingFrames {
-		if len(frame) == 0 {
-			separatorIndices = append(separatorIndices, i)
-		}
-	}
-	
-	// Analyze separator patterns to detect message type
-	return b.detectMessageTypeFromSeparators(workingFrames, separatorIndices, sender)
+	// Split frames using separators and detect message type
+	return b.detectMessageType(workingFrames, sender)
 }
 
-// detectMessageTypeFromSeparators uses separator patterns to identify message structure
-func (b *Broker) detectMessageTypeFromSeparators(workingFrames [][]byte, separatorIndices []int, sender []byte) (int, []byte, [][]byte) {
+// detectMessageType uses separator-based splitting to identify message structure
+func (b *Broker) detectMessageType(workingFrames [][]byte, sender []byte) (int, []byte, [][]byte) {
 	if len(workingFrames) < 2 {
 		if b.options.LogErrors {
 			log.Printf("MDP broker: insufficient working frames from %x", sender)
@@ -348,78 +371,79 @@ func (b *Broker) detectMessageTypeFromSeparators(workingFrames [][]byte, separat
 		return messageTypeUnknown, nil, nil
 	}
 	
-	// Pattern 1: Worker message [empty][protocol][command][...]
-	// This has exactly one separator at the beginning
-	if len(separatorIndices) >= 1 && separatorIndices[0] == 0 {
-		if len(workingFrames) >= 2 && len(workingFrames[1]) > 0 {
-			protocolFrame := workingFrames[1]
-			if string(protocolFrame) == WorkerProtocol {
+	// Split frames into parts using empty frame separators
+	parts := b.splitOnSeparators(workingFrames)
+	
+	if b.options.LogInfo {
+		log.Printf("MDP broker: split into %d parts from %x", len(parts), sender)
+		for i, part := range parts {
+			log.Printf("  part[%d]: %d frames", i, len(part))
+			for j, frame := range part {
+				log.Printf("    frame[%d]: %q", j, string(frame))
+			}
+		}
+	}
+	
+	// Look for protocol identifiers in the parts
+	for _, part := range parts {
+		if len(part) >= 1 {
+			protocolFrame := part[0]
+			protocolStr := string(protocolFrame)
+			
+			if protocolStr == WorkerProtocol {
 				if b.options.LogInfo {
 					log.Printf("MDP broker: detected worker message from %x", sender)
 				}
-				return messageTypeWorker, protocolFrame, workingFrames
-			}
-		}
-	}
-	
-	// Pattern 2: Client message - scan for protocol after separators
-	// Client messages may have multiple separators: [empty...][protocol][service][body...]
-	if len(separatorIndices) > 0 {
-		// Look for protocol frame after the last separator
-		lastSeparatorIdx := separatorIndices[len(separatorIndices)-1]
-		
-		// Scan frames after last separator for protocol
-		for i := lastSeparatorIdx + 1; i < len(workingFrames); i++ {
-			if len(workingFrames[i]) > 0 {
-				protocolFrame := workingFrames[i]
-				if string(protocolFrame) == ClientProtocol {
-					if b.options.LogInfo {
-						log.Printf("MDP broker: detected client message from %x", sender)
-					}
-					// For client parsing, we need [empty][protocol][service][body...]
-					// Find the separator immediately before the protocol frame
-					protocolStartIdx := i - 1
-					if protocolStartIdx >= 0 && len(workingFrames[protocolStartIdx]) == 0 {
-						return messageTypeClient, protocolFrame, workingFrames[protocolStartIdx:]
-					} else {
-						// No empty frame before protocol, create the expected structure
-						clientFrames := [][]byte{{}} // Start with empty frame
-						clientFrames = append(clientFrames, workingFrames[i:]...) // Add protocol and rest
-						return messageTypeClient, protocolFrame, clientFrames
-					}
+				// Reconstruct message frames with proper separator
+				// Format: [empty][protocol][command][...]
+				messageFrames := [][]byte{{}} // Start with empty separator
+				messageFrames = append(messageFrames, part...)
+				return messageTypeWorker, protocolFrame, messageFrames
+				
+			} else if protocolStr == ClientProtocol {
+				if b.options.LogInfo {
+					log.Printf("MDP broker: detected client message from %x", sender)
 				}
-				// If we find a non-empty frame that's not a protocol, this isn't a valid message
-				break
+				// Reconstruct message frames with proper separator
+				// Format: [empty][protocol][service][body...]
+				messageFrames := [][]byte{{}} // Start with empty separator
+				messageFrames = append(messageFrames, part...)
+				return messageTypeClient, protocolFrame, messageFrames
 			}
 		}
 	}
 	
-	// Pattern 3: Fallback - scan all frames for protocols (handles unknown separator patterns)
+	// Fallback: scan all frames directly for protocol identifiers
+	// This handles cases where frames might not be properly separated
 	for i, frame := range workingFrames {
 		if len(frame) > 0 {
 			frameStr := string(frame)
-			if frameStr == WorkerProtocol {
+			if frameStr == WorkerProtocol || frameStr == ClientProtocol {
 				if b.options.LogInfo {
-					log.Printf("MDP broker: detected worker message (fallback) from %x", sender)
+					log.Printf("MDP broker: detected %s message (fallback) from %x", 
+						map[string]string{WorkerProtocol: "worker", ClientProtocol: "client"}[frameStr], sender)
 				}
-				// For worker, we need the empty frame before protocol
-				if i > 0 {
-					return messageTypeWorker, frame, workingFrames[i-1:]
+				
+				// Find the start of the message (should be preceded by empty frame)
+				startIdx := i
+				if i > 0 && len(workingFrames[i-1]) == 0 {
+					startIdx = i - 1
 				} else {
-					return messageTypeWorker, frame, workingFrames
-				}
-			} else if frameStr == ClientProtocol {
-				if b.options.LogInfo {
-					log.Printf("MDP broker: detected client message (fallback) from %x", sender)
-				}
-				// For client, find the separator before protocol
-				for j := i - 1; j >= 0; j-- {
-					if len(workingFrames[j]) == 0 {
-						return messageTypeClient, frame, workingFrames[j:]
+					// No empty frame before protocol, insert one
+					messageFrames := [][]byte{{}} // Start with empty separator
+					messageFrames = append(messageFrames, workingFrames[i:]...)
+					if frameStr == WorkerProtocol {
+						return messageTypeWorker, frame, messageFrames
+					} else {
+						return messageTypeClient, frame, messageFrames
 					}
 				}
-				// No separator found, use from beginning
-				return messageTypeClient, frame, workingFrames
+				
+				if frameStr == WorkerProtocol {
+					return messageTypeWorker, frame, workingFrames[startIdx:]
+				} else {
+					return messageTypeClient, frame, workingFrames[startIdx:]
+				}
 			}
 		}
 	}
@@ -427,7 +451,6 @@ func (b *Broker) detectMessageTypeFromSeparators(workingFrames [][]byte, separat
 	// Unable to detect message type
 	if b.options.LogErrors {
 		log.Printf("MDP broker: unrecognized message format from %x", sender)
-		log.Printf("  separators at indices: %v", separatorIndices)
 		for i, frame := range workingFrames {
 			if len(frame) > 0 {
 				log.Printf("  working_frame[%d]: %q (len=%d)", i, string(frame), len(frame))
