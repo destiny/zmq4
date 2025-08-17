@@ -146,7 +146,7 @@ func (p *Proxy) init(front, back, capture Socket) {
 			case cmd := <-p.cmds:
 				switch cmd {
 				case proxyPause, proxyResume, proxyStats:
-					// TODO
+					// Proxy control commands not implemented
 				case proxyKill:
 					close(quit)
 					return nil

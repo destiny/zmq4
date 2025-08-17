@@ -21,8 +21,8 @@
 # Go workspace file
 go.work
 
-# Go mod download cache
-go.sum
+# Go mod download cache (go.sum should be committed)
+# go.sum
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -77,3 +77,16 @@ coverage.out
 # Debug files
 debug
 debug.test
+
+# Development and analysis files
+*REPORT*.md
+*ANALYSIS*.md
+*SUMMARY*.md
+
+# Benchmark results
+*.bench
+benchmark.txt
+
+# Documentation generation
+docs/
+doc.go.bak

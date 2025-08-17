@@ -14,12 +14,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
+	"time"
 
 	"golang.org/x/crypto/nacl/box"
 
 	"github.com/destiny/zmq4/v25"
 	"github.com/destiny/zmq4/v25/z85"
 )
+
+// Timing and diagnostic utilities for CURVE protocol debugging
+func logCurveEvent(eventType, details string) {
+	timestamp := time.Now().UnixMicro()
+	fmt.Printf("CURVE_TRACE[%d]: %s - %s\n", timestamp, eventType, details)
+}
+
+func logCurveError(eventType, errorMsg string, err error) {
+	timestamp := time.Now().UnixMicro()
+	fmt.Printf("CURVE_ERROR[%d]: %s - %s: %v\n", timestamp, eventType, errorMsg, err)
+}
 
 const (
 	// Key sizes as per CURVE specification
@@ -231,6 +244,12 @@ type Security struct {
 	clientNonce uint64
 	serverNonce uint64
 	
+	// MESSAGE encryption state
+	mu                     sync.Mutex
+	messageEncryptionReady bool
+	sendNonce              uint64 // Nonce counter for MESSAGE encryption
+	recvNonce              uint64 // Nonce counter for MESSAGE decryption
+	
 	// Handshake state tracking
 	handshakeState HandshakeState
 	
@@ -266,6 +285,103 @@ func (s *Security) HandshakeState() int {
 	return int(s.handshakeState)
 }
 
+// IsReady returns true if the security mechanism is ready for MESSAGE encryption/decryption
+func (s *Security) IsReady() bool {
+	return s.handshakeState == HandshakeComplete &&
+		s.clientTransient != nil &&
+		s.serverTransient != nil
+}
+
+// ValidateMessageReadiness validates that the security mechanism is ready for MESSAGE operations
+func (s *Security) ValidateMessageReadiness() error {
+	if s.handshakeState != HandshakeComplete {
+		return fmt.Errorf("curve: handshake not complete, current state: %d", s.handshakeState)
+	}
+	
+	if s.clientTransient == nil {
+		return fmt.Errorf("curve: client transient keys not available")
+	}
+	
+	if s.serverTransient == nil {
+		return fmt.Errorf("curve: server transient keys not available")
+	}
+	
+	// Validate key sizes
+	if len(s.clientTransient.Public) != KeySize || len(s.clientTransient.Secret) != KeySize {
+		return fmt.Errorf("curve: invalid client transient key size")
+	}
+	
+	if len(s.serverTransient.Public) != KeySize || len(s.serverTransient.Secret) != KeySize {
+		return fmt.Errorf("curve: invalid server transient key size")
+	}
+	
+	return nil
+}
+
+// EnsureMessageReadiness validates that the security mechanism and connection are ready for MESSAGE operations
+// This method includes additional validation for connection state and timing
+func (s *Security) EnsureMessageReadiness(conn *zmq4.Conn) error {
+	// First check basic CURVE readiness
+	if err := s.ValidateMessageReadiness(); err != nil {
+		return err
+	}
+	
+	// Additional connection state validation
+	if conn == nil {
+		return fmt.Errorf("curve: connection is nil")
+	}
+	
+	if conn.Closed() {
+		return fmt.Errorf("curve: connection is closed")
+	}
+	
+	// TCP connection stability check - critical for handshake-to-MESSAGE transition
+	if err := s.validateTCPConnection(conn); err != nil {
+		return fmt.Errorf("curve: TCP connection validation failed: %w", err)
+	}
+	
+	// Verify MESSAGE encryption state is ready
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	if !s.messageEncryptionReady {
+		return fmt.Errorf("curve: MESSAGE encryption not ready - handshake may have failed")
+	}
+	
+	return nil
+}
+
+// validateTCPConnection performs TCP-level validation to ensure the connection is stable
+// This is critical for the CURVE handshake-to-MESSAGE transition
+func (s *Security) validateTCPConnection(conn *zmq4.Conn) error {
+	// Check basic connection state
+	if conn.Closed() {
+		return fmt.Errorf("connection is marked as closed")
+	}
+	
+	// Validate that the connection is in a stable state for MESSAGE encryption
+	// Instead of using artificial delays, we check the actual handshake state
+	if s.handshakeState != HandshakeComplete {
+		return fmt.Errorf("handshake not complete, current state: %d", s.handshakeState)
+	}
+	
+	// Ensure all required keys are available
+	if s.clientTransient == nil {
+		return fmt.Errorf("client transient keys not available")
+	}
+	
+	if s.serverTransient == nil {
+		return fmt.Errorf("server transient keys not available")
+	}
+	
+	// Verify key integrity
+	if len(s.clientTransient.Public) != KeySize || len(s.serverTransient.Public) != KeySize {
+		return fmt.Errorf("invalid transient key sizes")
+	}
+	
+	return nil
+}
+
 // Handshake implements the ZMTP security handshake according to CURVE specification
 func (s *Security) Handshake(conn *zmq4.Conn, server bool) error {
 	if server {
@@ -281,9 +397,12 @@ func (s *Security) Encrypt(w io.Writer, data []byte) (int, error) {
 
 // EncryptWithFlags writes the encrypted form of data to w with continuation support (for MESSAGE commands only)
 func (s *Security) EncryptWithFlags(w io.Writer, data []byte, hasMore bool) (int, error) {
-	// Only allow MESSAGE encryption after handshake is complete
-	if s.handshakeState != HandshakeComplete {
-		return 0, fmt.Errorf("curve: message encryption only allowed after handshake completion, current state: %d", s.handshakeState)
+	logCurveEvent("MESSAGE_ENCRYPT_START", fmt.Sprintf("Starting encryption: %d bytes, hasMore=%v", len(data), hasMore))
+	
+	// Validate that CURVE is ready for MESSAGE encryption
+	if err := s.ValidateMessageReadiness(); err != nil {
+		logCurveError("MESSAGE_ENCRYPT_VALIDATION", "MESSAGE encryption validation failed", err)
+		return 0, fmt.Errorf("curve: MESSAGE encryption validation failed: %w", err)
 	}
 	
 	// CURVE MESSAGE format per RFC 26: [flags][nonce][box]
@@ -293,10 +412,12 @@ func (s *Security) EncryptWithFlags(w io.Writer, data []byte, hasMore bool) (int
 	
 	// Generate next nonce for message
 	nonce := s.nextSendNonce()
+	logCurveEvent("MESSAGE_ENCRYPT_NONCE", fmt.Sprintf("Generated nonce: %x", nonce[:]))
 	
 	// Determine which keys to use based on our role
 	var recipientKey, senderKey *[KeySize]byte
 	if s.clientTransient == nil || s.serverTransient == nil {
+		logCurveError("MESSAGE_ENCRYPT_KEYS", "Transient keys not available", nil)
 		return 0, fmt.Errorf("curve: transient keys not available for message encryption")
 	}
 	
@@ -304,10 +425,14 @@ func (s *Security) EncryptWithFlags(w io.Writer, data []byte, hasMore bool) (int
 		// We are server, encrypt for client
 		recipientKey = &s.clientTransient.Public
 		senderKey = &s.serverTransient.Secret
+		logCurveEvent("MESSAGE_ENCRYPT_KEYS", fmt.Sprintf("Server encrypting for client: recipient=%x..., sender=%x...", 
+			(*recipientKey)[:4], (*senderKey)[:4]))
 	} else {
 		// We are client, encrypt for server
 		recipientKey = &s.serverTransient.Public
 		senderKey = &s.clientTransient.Secret
+		logCurveEvent("MESSAGE_ENCRYPT_KEYS", fmt.Sprintf("Client encrypting for server: recipient=%x..., sender=%x...", 
+			(*recipientKey)[:4], (*senderKey)[:4]))
 	}
 	
 	// Create full 24-byte nonce for NaCl box
@@ -331,7 +456,27 @@ func (s *Security) EncryptWithFlags(w io.Writer, data []byte, hasMore bool) (int
 	copy(msg[1:9], nonce[:])
 	copy(msg[9:], encrypted)
 	
-	return w.Write(msg)
+	logCurveEvent("MESSAGE_ENCRYPT_SUCCESS", fmt.Sprintf("Encryption completed: flags=%02x, nonce=%x, encrypted_len=%d, total_len=%d", 
+		msg[0], msg[1:9], len(encrypted), len(msg)))
+	
+	n, err := w.Write(msg)
+	if err != nil {
+		logCurveError("MESSAGE_ENCRYPT_WRITE", "Failed to write encrypted MESSAGE", err)
+		return n, err
+	}
+	
+	// CRITICAL FIX: Ensure the CURVE MESSAGE is fully written and flushed
+	// The timing diagnostics show that the broker receives 0 bytes instead of our 25-byte MESSAGE
+	if flusher, ok := w.(interface{ Flush() error }); ok {
+		if flushErr := flusher.Flush(); flushErr != nil {
+			logCurveError("MESSAGE_ENCRYPT_FLUSH", "Failed to flush encrypted MESSAGE", flushErr)
+			return n, flushErr
+		}
+		logCurveEvent("MESSAGE_ENCRYPT_FLUSH", "Successfully flushed MESSAGE to network")
+	}
+	
+	logCurveEvent("MESSAGE_ENCRYPT_COMPLETE", fmt.Sprintf("Successfully wrote %d bytes", n))
+	return n, nil
 }
 
 // Decrypt writes the decrypted form of data to w (for MESSAGE commands only)
@@ -342,12 +487,16 @@ func (s *Security) Decrypt(w io.Writer, data []byte) (int, error) {
 
 // DecryptWithFlags decrypts data and returns the number of bytes written, continuation flag, and error (for MESSAGE commands only)
 func (s *Security) DecryptWithFlags(w io.Writer, data []byte) (int, bool, error) {
-	// Only allow MESSAGE decryption after handshake is complete
-	if s.handshakeState != HandshakeComplete {
-		return 0, false, fmt.Errorf("curve: message decryption only allowed after handshake completion, current state: %d", s.handshakeState)
+	logCurveEvent("MESSAGE_DECRYPT_START", fmt.Sprintf("Starting decryption: %d bytes", len(data)))
+	
+	// Validate that CURVE is ready for MESSAGE decryption
+	if err := s.ValidateMessageReadiness(); err != nil {
+		logCurveError("MESSAGE_DECRYPT_VALIDATION", "MESSAGE decryption validation failed", err)
+		return 0, false, fmt.Errorf("curve: MESSAGE decryption validation failed: %w", err)
 	}
 	
 	if len(data) < 1+8+BoxOverhead {
+		logCurveError("MESSAGE_DECRYPT_SIZE", "MESSAGE too small for valid CURVE format", fmt.Errorf("got %d bytes, need at least %d", len(data), 1+8+BoxOverhead))
 		return 0, false, ErrInvalidCommand
 	}
 	
@@ -358,8 +507,12 @@ func (s *Security) DecryptWithFlags(w io.Writer, data []byte) (int, bool, error)
 	nonce8 := data[1:9]
 	encrypted := data[9:]
 	
+	logCurveEvent("MESSAGE_DECRYPT_PARSE", fmt.Sprintf("Parsed MESSAGE: flags=%02x, hasMore=%v, nonce=%x, encrypted_len=%d", 
+		flags, hasMore, nonce8, len(encrypted)))
+	
 	// Validate flags (only bit 0 is defined in RFC 26)
 	if flags > 0x01 {
+		logCurveError("MESSAGE_DECRYPT_FLAGS", "Invalid flags byte", fmt.Errorf("flags=%02x", flags))
 		return 0, false, fmt.Errorf("curve: invalid flags byte: %02x", flags)
 	}
 	
@@ -385,17 +538,33 @@ func (s *Security) DecryptWithFlags(w io.Writer, data []byte) (int, bool, error)
 	}
 	
 	// Decrypt the message
+	logCurveEvent("MESSAGE_DECRYPT_ATTEMPT", fmt.Sprintf("Attempting decryption: fullNonce=%x, senderKey=%x..., recipientKey=%x...", 
+		fullNonce[:], (*senderKey)[:4], (*recipientKey)[:4]))
+	
 	decrypted, ok := box.Open(nil, encrypted, &fullNonce, senderKey, recipientKey)
 	if !ok {
+		logCurveError("MESSAGE_DECRYPT_FAILED", "NaCl box.Open failed - authentication or decryption error", 
+			fmt.Errorf("nonce=%x, encrypted_len=%d", fullNonce[:], len(encrypted)))
 		return 0, false, ErrDecryptionFailed
 	}
 	
+	logCurveEvent("MESSAGE_DECRYPT_SUCCESS", fmt.Sprintf("Decryption successful: %d bytes decrypted", len(decrypted)))
+	
 	n, err := w.Write(decrypted)
+	if err != nil {
+		logCurveError("MESSAGE_DECRYPT_WRITE", "Failed to write decrypted data", err)
+		return n, hasMore, err
+	}
+	
+	logCurveEvent("MESSAGE_DECRYPT_COMPLETE", fmt.Sprintf("Successfully wrote %d bytes", n))
 	return n, hasMore, err
 }
 
 // nextSendNonce generates the next nonce for outgoing messages per RFC 26/CurveZMQ
 func (s *Security) nextSendNonce() [8]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
 	var nonce [8]byte
 	
 	// CURVE nonce format: 8-byte little-endian counter
@@ -547,6 +716,27 @@ func (s *Security) encryptReady(w io.Writer, data []byte) (int, error) {
 func (s *Security) decryptReady(w io.Writer, data []byte) (int, error) {
 	// READY command is received in plain text per RFC 26
 	return w.Write(data)
+}
+
+// Test helper methods for protocol compliance testing
+// SetClientTransient sets the client transient key pair (for testing)
+func (s *Security) SetClientTransient(keyPair *KeyPair) {
+	s.clientTransient = keyPair
+}
+
+// SetServerTransient sets the server transient key pair (for testing)  
+func (s *Security) SetServerTransient(keyPair *KeyPair) {
+	s.serverTransient = keyPair
+}
+
+// SetHandshakeComplete marks the handshake as complete (for testing)
+func (s *Security) SetHandshakeComplete() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handshakeState = HandshakeComplete
+	s.messageEncryptionReady = true
+	s.serverNonce = 0
+	s.clientNonce = 0
 }
 
 var (

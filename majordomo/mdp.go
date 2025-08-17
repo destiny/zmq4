@@ -8,6 +8,7 @@ package majordomo
 
 import (
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -82,6 +83,9 @@ type Message struct {
 	// Common fields
 	Frames [][]byte
 	
+	// Routing envelope (added by ROUTER sockets)
+	RoutingEnvelope [][]byte
+	
 	// Client message fields
 	Service ServiceName
 	Body    []byte
@@ -89,6 +93,9 @@ type Message struct {
 	// Worker message fields
 	Command    string
 	ClientAddr []byte
+	
+	// Client envelope for broker-worker communication
+	ClientEnvelope [][]byte
 	
 	// Timestamps
 	Timestamp time.Time
@@ -122,12 +129,13 @@ func NewWorkerMessage(command string, clientAddr []byte, body []byte) *Message {
 	}
 }
 
-// FormatClientRequest formats a message as a client REQUEST
+// FormatClientRequest formats a message as a client REQUEST per RFC 7/MDP
 func (m *Message) FormatClientRequest() [][]byte {
-	// CLIENT REQUEST: [empty][protocol][service][body...]
+	// CLIENT REQUEST: [empty][protocol]["REQUEST"][service][body...]
 	frames := [][]byte{
-		{}, // Empty frame
+		{}, // Empty delimiter frame
 		[]byte(ClientProtocol),
+		[]byte("REQUEST"), // Explicit command
 		[]byte(m.Service),
 	}
 	
@@ -138,13 +146,24 @@ func (m *Message) FormatClientRequest() [][]byte {
 	return frames
 }
 
-// FormatClientReply formats a message as a client REPLY
+// FormatClientReply formats a message as a client REPLY (not typically used by clients)
 func (m *Message) FormatClientReply() [][]byte {
-	// CLIENT REPLY: [protocol][service][body...] (no empty frame for REQ socket)
-	frames := [][]byte{
-		[]byte(ClientProtocol),
-		[]byte(m.Service),
+	// CLIENT REPLY: [routing_envelope...][empty][protocol]["REPLY"][body...]
+	// Note: This format is used by broker when replying to client
+	frames := [][]byte{}
+	
+	// Add routing envelope if present
+	if len(m.RoutingEnvelope) > 0 {
+		frames = append(frames, m.RoutingEnvelope...)
 	}
+	
+	// Add protocol frames
+	frames = append(frames, 
+		[]byte{}, // Empty delimiter frame
+		[]byte(ClientProtocol),
+		[]byte("REPLY"), // Explicit command
+		[]byte(m.Service), // Service name
+	)
 	
 	if len(m.Body) > 0 {
 		frames = append(frames, m.Body)
@@ -155,41 +174,63 @@ func (m *Message) FormatClientReply() [][]byte {
 
 // FormatWorkerMessage formats a message as a worker protocol message per RFC 7/MDP
 func (m *Message) FormatWorkerMessage() [][]byte {
-	// Base frames: [empty][protocol][command]
-	frames := [][]byte{
-		{}, // Empty frame
+	// Base frames: [routing_envelope...][empty][protocol][command]
+	frames := [][]byte{}
+	
+	// Add routing envelope if present
+	if len(m.RoutingEnvelope) > 0 {
+		frames = append(frames, m.RoutingEnvelope...)
+	}
+	
+	// Add delimiter and protocol frames
+	frames = append(frames,
+		[]byte{}, // Empty delimiter frame
 		[]byte(WorkerProtocol),
 		[]byte(m.Command),
-	}
+	)
 	
 	// Handle different worker commands according to RFC 7
 	switch m.Command {
 	case WorkerReady:
-		// READY: [empty][protocol][command][service]
+		// READY: [routing...][empty][protocol][command][service]
 		if len(m.Service) > 0 {
 			frames = append(frames, []byte(m.Service))
 		}
 		
 	case WorkerRequest, WorkerReply:
-		// REQUEST/REPLY: [empty][protocol][command][client][empty][body...]
-		if len(m.ClientAddr) > 0 {
+		// REQUEST/REPLY: [routing...][empty][protocol][command][client_envelope...][empty][body...]
+		// Add client envelope frames
+		if len(m.ClientEnvelope) > 0 {
+			frames = append(frames, m.ClientEnvelope...)
+		} else if len(m.ClientAddr) > 0 {
+			// Fallback to single client address for compatibility
 			frames = append(frames, m.ClientAddr)
-			frames = append(frames, []byte{}) // Empty frame separator
+		}
+		
+		// Add empty separator
+		frames = append(frames, []byte{})
+		
+		// Add body if present
+		if len(m.Body) > 0 {
+			frames = append(frames, m.Body)
+		}
+		
+	case WorkerHeartbeat, WorkerDisconnect:
+		// HEARTBEAT/DISCONNECT: [routing...][empty][protocol][command]
+		// No additional frames needed
+		
+	default:
+		// For unknown commands, include client envelope if present (backwards compatibility)
+		if len(m.ClientEnvelope) > 0 {
+			frames = append(frames, m.ClientEnvelope...)
+			frames = append(frames, []byte{}) // Empty separator
 			
 			if len(m.Body) > 0 {
 				frames = append(frames, m.Body)
 			}
-		}
-		
-	case WorkerHeartbeat, WorkerDisconnect:
-		// HEARTBEAT/DISCONNECT: [empty][protocol][command]
-		// No additional frames needed
-		
-	default:
-		// For unknown commands, include client_addr if present (backwards compatibility)
-		if len(m.ClientAddr) > 0 {
+		} else if len(m.ClientAddr) > 0 {
 			frames = append(frames, m.ClientAddr)
-			frames = append(frames, []byte{}) // Empty frame separator
+			frames = append(frames, []byte{}) // Empty separator
 			
 			if len(m.Body) > 0 {
 				frames = append(frames, m.Body)
@@ -200,109 +241,228 @@ func (m *Message) FormatWorkerMessage() [][]byte {
 	return frames
 }
 
-// ParseClientMessage parses frames as a client protocol message
+// findDelimiterFrame finds the empty delimiter frame that separates routing envelope from protocol
+func findDelimiterFrame(frames [][]byte) int {
+	for i, frame := range frames {
+		if len(frame) == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// ParseClientMessage parses frames as a client protocol message with proper routing envelope handling
 func ParseClientMessage(frames [][]byte) (*Message, error) {
-	// For replies from broker to REQ socket: [protocol][service][body...]
-	// For requests from REQ socket: [empty][protocol][service][body...]
-	
-	var protocolIdx, serviceIdx, bodyIdx int
-	
-	// Check if this is a reply (no empty frame) or request (has empty frame)
-	if len(frames) >= 3 && len(frames[0]) == 0 {
-		// Request format: [empty][protocol][service][body...]
-		protocolIdx, serviceIdx, bodyIdx = 1, 2, 3
-	} else if len(frames) >= 2 {
-		// Reply format: [protocol][service][body...]
-		protocolIdx, serviceIdx, bodyIdx = 0, 1, 2
-	} else {
+	if len(frames) < 2 {
 		return nil, fmt.Errorf("mdp: client message too short: %d frames", len(frames))
 	}
 	
-	// Check protocol
-	if string(frames[protocolIdx]) != ClientProtocol {
-		return nil, fmt.Errorf("mdp: invalid client protocol: %s", string(frames[protocolIdx]))
+	// Find the delimiter frame that separates routing envelope from protocol
+	delimiterIdx := findDelimiterFrame(frames)
+	
+	var routingEnvelope [][]byte
+	var protocolFrames [][]byte
+	
+	if delimiterIdx >= 0 {
+		// Found delimiter: extract routing envelope and protocol frames
+		routingEnvelope = frames[:delimiterIdx]
+		protocolFrames = frames[delimiterIdx+1:] // Skip delimiter frame
+	} else {
+		// No delimiter found - this might be a direct client message (REQ socket)
+		// or a reply from broker to client
+		routingEnvelope = nil
+		protocolFrames = frames
 	}
 	
-	if serviceIdx >= len(frames) {
-		return nil, fmt.Errorf("mdp: client message missing service")
+	if len(protocolFrames) < 2 {
+		return nil, fmt.Errorf("mdp: client protocol frames too short: %d frames", len(protocolFrames))
 	}
 	
-	service := ServiceName(frames[serviceIdx])
-	if err := service.Validate(); err != nil {
-		return nil, fmt.Errorf("mdp: %w", err)
+	// Check protocol header
+	if string(protocolFrames[0]) != ClientProtocol {
+		return nil, fmt.Errorf("mdp: invalid client protocol: %s", string(protocolFrames[0]))
+	}
+	
+	if len(protocolFrames) < 3 {
+		return nil, fmt.Errorf("mdp: client protocol frames missing command or service")
+	}
+	
+	// Extract command (should be REQUEST or REPLY)
+	command := string(protocolFrames[1])
+	
+	var service ServiceName
+	var bodyIdx int
+	
+	switch command {
+	case "REQUEST":
+		if len(protocolFrames) < 3 {
+			return nil, fmt.Errorf("mdp: REQUEST message missing service name")
+		}
+		service = ServiceName(protocolFrames[2])
+		bodyIdx = 3
+		
+	case "REPLY":
+		// REPLY messages have format: [protocol]["REPLY"][service][body...]
+		if len(protocolFrames) < 3 {
+			return nil, fmt.Errorf("mdp: REPLY message missing service name")
+		}
+		service = ServiceName(protocolFrames[2])
+		bodyIdx = 3
+		
+	default:
+		// For backward compatibility, treat as old format: [protocol][service][body...]
+		service = ServiceName(protocolFrames[1])
+		bodyIdx = 2
+	}
+	
+	if len(service) > 0 {
+		if err := service.Validate(); err != nil {
+			return nil, fmt.Errorf("mdp: %w", err)
+		}
 	}
 	
 	msg := &Message{
-		Frames:    frames,
-		Service:   service,
-		Timestamp: time.Now(),
+		Frames:          frames,
+		RoutingEnvelope: routingEnvelope,
+		Command:         command,
+		Service:         service,
+		Timestamp:       time.Now(),
 	}
 	
 	// Extract body if present
-	if bodyIdx < len(frames) {
-		msg.Body = frames[bodyIdx]
+	if len(protocolFrames) > bodyIdx {
+		msg.Body = protocolFrames[bodyIdx]
 	}
 	
 	return msg, nil
 }
 
-// ParseWorkerMessage parses frames as a worker protocol message
+// ParseWorkerMessage parses frames as a worker protocol message with proper routing envelope handling
 func ParseWorkerMessage(frames [][]byte) (*Message, error) {
+	log.Printf("ParseWorkerMessage: starting with %d frames", len(frames))
+	for i, frame := range frames {
+		if len(frame) > 0 {
+			log.Printf("  input_frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+		} else {
+			log.Printf("  input_frame[%d]: <empty> (len=%d)", i, len(frame))
+		}
+	}
+	
 	if len(frames) < 3 {
+		log.Printf("ParseWorkerMessage: FAILED - too short: %d frames", len(frames))
 		return nil, fmt.Errorf("mdp: worker message too short: %d frames", len(frames))
 	}
 	
-	// Check empty frame
-	if len(frames[0]) != 0 {
-		return nil, fmt.Errorf("mdp: worker message missing empty frame")
+	// Find the delimiter frame that separates routing envelope from protocol
+	delimiterIdx := findDelimiterFrame(frames)
+	log.Printf("ParseWorkerMessage: delimiter found at index %d", delimiterIdx)
+	
+	var routingEnvelope [][]byte
+	var protocolFrames [][]byte
+	
+	if delimiterIdx >= 0 {
+		// Found delimiter: extract routing envelope and protocol frames
+		routingEnvelope = frames[:delimiterIdx]
+		protocolFrames = frames[delimiterIdx+1:] // Skip delimiter frame
+		log.Printf("ParseWorkerMessage: routing envelope has %d frames, protocol has %d frames", len(routingEnvelope), len(protocolFrames))
+	} else {
+		log.Printf("ParseWorkerMessage: FAILED - missing empty separator")
+		return nil, fmt.Errorf("mdp: worker message missing empty separator")
 	}
 	
-	// Check protocol
-	if string(frames[1]) != WorkerProtocol {
-		return nil, fmt.Errorf("mdp: invalid worker protocol: %s", string(frames[1]))
+	if len(protocolFrames) < 2 {
+		log.Printf("ParseWorkerMessage: FAILED - protocol frames too short: %d frames", len(protocolFrames))
+		return nil, fmt.Errorf("mdp: worker protocol frames too short: %d frames", len(protocolFrames))
 	}
 	
-	command := string(frames[2])
+	// Check protocol header
+	log.Printf("ParseWorkerMessage: checking protocol header: %q vs expected %q", string(protocolFrames[0]), WorkerProtocol)
+	if string(protocolFrames[0]) != WorkerProtocol {
+		log.Printf("ParseWorkerMessage: FAILED - invalid protocol header: %s", string(protocolFrames[0]))
+		return nil, fmt.Errorf("mdp: invalid worker protocol: %s", string(protocolFrames[0]))
+	}
+	
+	// Extract command
+	command := string(protocolFrames[1])
+	log.Printf("ParseWorkerMessage: extracted command: %q (bytes=%v)", command, []byte(command))
 	
 	msg := &Message{
-		Frames:    frames,
-		Command:   command,
-		Timestamp: time.Now(),
+		Frames:          frames,
+		RoutingEnvelope: routingEnvelope,
+		Command:         command,
+		Timestamp:       time.Now(),
 	}
 	
 	// Parse command-specific fields
 	switch command {
 	case WorkerReady:
-		if len(frames) < 4 {
+		if len(protocolFrames) < 3 {
 			return nil, fmt.Errorf("mdp: READY message missing service name")
 		}
-		msg.Service = ServiceName(frames[3])
+		msg.Service = ServiceName(protocolFrames[2])
 		if err := msg.Service.Validate(); err != nil {
 			return nil, fmt.Errorf("mdp: %w", err)
 		}
 		
 	case WorkerRequest, WorkerReply:
-		if len(frames) < 5 {
+		log.Printf("ParseWorkerMessage: processing %s command", command)
+		if len(protocolFrames) < 3 {
+			log.Printf("ParseWorkerMessage: FAILED - %s message too short: %d frames", command, len(protocolFrames))
 			return nil, fmt.Errorf("mdp: %s message too short", command)
 		}
-		msg.ClientAddr = frames[3]
-		// frames[4] should be empty separator
-		if len(frames[4]) != 0 {
+		
+		// For REQUEST/REPLY, we need to parse the client envelope
+		// Format: [protocol][command][client_envelope...][empty_separator][body]
+		log.Printf("ParseWorkerMessage: looking for empty separator in protocol frames:")
+		for i, frame := range protocolFrames {
+			if len(frame) > 0 {
+				log.Printf("  protocol_frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  protocol_frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+		
+		// Find the empty separator that marks end of client envelope
+		separatorIdx := -1
+		for i := 2; i < len(protocolFrames); i++ {
+			if len(protocolFrames[i]) == 0 {
+				separatorIdx = i
+				log.Printf("ParseWorkerMessage: found separator at protocol index %d", i)
+				break
+			}
+		}
+		
+		if separatorIdx == -1 {
+			log.Printf("ParseWorkerMessage: FAILED - %s message missing empty separator", command)
 			return nil, fmt.Errorf("mdp: %s message missing empty separator", command)
 		}
 		
-		// Extract body if present
-		if len(frames) > 5 {
-			msg.Body = frames[5]
+		// Extract client envelope (frames between command and separator)
+		if separatorIdx > 2 {
+			msg.ClientEnvelope = protocolFrames[2:separatorIdx]
+			log.Printf("ParseWorkerMessage: extracted client envelope with %d frames", len(msg.ClientEnvelope))
+			// For compatibility, set ClientAddr to first frame of envelope
+			if len(msg.ClientEnvelope) > 0 {
+				msg.ClientAddr = msg.ClientEnvelope[0]
+				log.Printf("ParseWorkerMessage: client addr: %q", string(msg.ClientAddr))
+			}
+		}
+		
+		// Extract body if present (after separator)
+		if len(protocolFrames) > separatorIdx+1 {
+			msg.Body = protocolFrames[separatorIdx+1]
+			log.Printf("ParseWorkerMessage: extracted body: %q (len=%d)", string(msg.Body), len(msg.Body))
 		}
 		
 	case WorkerHeartbeat, WorkerDisconnect:
 		// No additional fields required
 		
 	default:
+		log.Printf("ParseWorkerMessage: FAILED - unknown command: %s", command)
 		return nil, fmt.Errorf("mdp: unknown worker command: %s", command)
 	}
 	
+	log.Printf("ParseWorkerMessage: SUCCESS - parsed %s command", command)
 	return msg, nil
 }
 

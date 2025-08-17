@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/destiny/zmq4/v25"
@@ -37,6 +38,8 @@ const (
 	stateDecreaseLiveness
 	stateSetHeartbeatTime
 	stateSetRunning
+	stateSetSocketReady
+	stateSetSocketClosed
 )
 
 // stateUpdate represents a state change message
@@ -71,6 +74,7 @@ const (
 	queryGetReplyTo
 	queryGetHeartbeatTime
 	queryGetLiveness
+	queryIsSocketReady
 )
 
 // queryRequest represents a request for current state/stats
@@ -127,18 +131,21 @@ type Worker struct {
 	stopCh      chan struct{}
 	heartbeatCh chan struct{}
 	
-	// Socket communication channels
-	sendCh     chan workerMessage
-	recvCh     chan zmq4.Msg
-	errorCh    chan error
-	closeCh    chan struct{}
-	socketDone chan struct{}
+	// Socket communication channels (lifecycle managed)
+	socketMu        sync.RWMutex  // Protects socket communication channels
+	sendCh          chan workerMessage
+	recvCh          chan zmq4.Msg
+	errorCh         chan error
+	closeCh         chan struct{}
+	socketDone      chan struct{}
+	socketManagerID uint64  // Unique ID for socket manager sessions
 	
 	// State management channels
 	stateUpdateCh chan stateUpdate
 	statsUpdateCh chan statsUpdate
 	queryCh       chan queryRequest
 	stateDone     chan struct{}
+	stateStopped  int32  // Atomic flag to ensure state manager is only stopped once
 	
 	// Statistics
 	totalRequests uint64
@@ -173,11 +180,8 @@ func NewWorker(service ServiceName, brokerEndpoint string, handler RequestHandle
 		liveness:       options.HeartbeatLiveness,
 		stopCh:         make(chan struct{}),
 		heartbeatCh:    make(chan struct{}, 1),
-		sendCh:         make(chan workerMessage, 10),
-		recvCh:         make(chan zmq4.Msg, 10),
-		errorCh:        make(chan error, 1),
-		closeCh:        make(chan struct{}),
-		socketDone:     make(chan struct{}),
+		// Socket communication channels will be created in initSocketChannels()
+		socketManagerID: 0,
 		stateUpdateCh:  make(chan stateUpdate, 10),
 		statsUpdateCh:  make(chan statsUpdate, 10),
 		queryCh:        make(chan queryRequest, 5),
@@ -187,7 +191,49 @@ func NewWorker(service ServiceName, brokerEndpoint string, handler RequestHandle
 	// Start state manager immediately so queries work
 	go w.stateManager()
 	
+	// Initialize socket channels for first use
+	w.initSocketChannels()
+	
 	return w, nil
+}
+
+// initSocketChannels initializes or reinitializes socket communication channels
+func (w *Worker) initSocketChannels() {
+	w.socketMu.Lock()
+	defer w.socketMu.Unlock()
+	
+	// Increment socket manager ID to invalidate old managers
+	w.socketManagerID++
+	
+	// Create new channels for this socket session
+	w.sendCh = make(chan workerMessage, 10)
+	w.recvCh = make(chan zmq4.Msg, 10)
+	w.errorCh = make(chan error, 1)
+	w.closeCh = make(chan struct{})
+	w.socketDone = make(chan struct{})
+}
+
+// closeSocketChannels safely closes socket communication channels
+func (w *Worker) closeSocketChannels() {
+	w.socketMu.Lock()
+	defer w.socketMu.Unlock()
+	
+	// Signal any running socket manager to stop
+	select {
+	case w.closeCh <- struct{}{}:
+	default:
+	}
+	
+	// Wait for socket manager to finish (with timeout to prevent deadlock)
+	select {
+	case <-w.socketDone:
+		// Socket manager finished cleanly
+	case <-time.After(1 * time.Second):
+		// Timeout - socket manager may be stuck, continue anyway
+		if w.options.LogErrors {
+			log.Printf("MDP worker: timeout waiting for socket manager to finish")
+		}
+	}
 }
 
 // Start starts the worker
@@ -213,6 +259,8 @@ func (w *Worker) Start() error {
 func (w *Worker) Stop() error {
 	running := w.queryState(queryIsRunning)
 	if running == nil || !running.(bool) {
+		// Worker is not running, but we still need to clean up the state manager
+		w.stopStateManager()
 		return fmt.Errorf("mdp: worker not running")
 	}
 	
@@ -224,15 +272,27 @@ func (w *Worker) Stop() error {
 	
 	w.updateState(stateSetRunning, false)
 	
+	// First, stop the worker loop
 	w.cancel()
 	close(w.stopCh)
 	
+	// Stop any running socket manager
+	w.closeSocketChannels()
+	
+	// Close socket
+	w.mu.Lock()
 	if w.socket != nil {
 		err := w.socket.Close()
 		if err != nil {
+			w.mu.Unlock()
 			return fmt.Errorf("mdp: failed to close worker socket: %w", err)
 		}
+		w.socket = nil
 	}
+	w.mu.Unlock()
+	
+	// Stop state manager
+	w.stopStateManager()
 	
 	if w.options.LogInfo {
 		log.Printf("MDP worker for service %s stopped", w.service)
@@ -241,12 +301,30 @@ func (w *Worker) Stop() error {
 	return nil
 }
 
+// stopStateManager stops the state manager goroutine safely
+func (w *Worker) stopStateManager() {
+	// Stop state manager and wait for it to finish (only once)
+	if atomic.CompareAndSwapInt32(&w.stateStopped, 0, 1) {
+		close(w.stateUpdateCh)
+		select {
+		case <-w.stateDone:
+			// State manager stopped cleanly
+		case <-time.After(1 * time.Second):
+			// Timeout - state manager didn't stop, but continue anyway
+			if w.options.LogErrors {
+				log.Printf("MDP worker: timeout waiting for state manager to stop")
+			}
+		}
+	}
+}
+
 // workerLoop is the main worker processing loop
 func (w *Worker) workerLoop() {
 	defer func() {
-		// Stop state manager when exiting
-		close(w.stateUpdateCh)
-		<-w.stateDone
+		// Ensure any running socket manager is stopped
+		w.closeSocketChannels()
+		
+		// State manager will be stopped by Stop() method
 	}()
 	
 	for {
@@ -254,17 +332,43 @@ func (w *Worker) workerLoop() {
 		case <-w.stopCh:
 			return
 		default:
-			// Connect to broker
-			w.connectToBroker()
+			// Ensure previous socket manager is stopped before starting new one
+			w.closeSocketChannels()
 			
-			// Start socket manager goroutine
-			go w.socketManager()
+			// Connect to broker (this will reinitialize channels)
+			if !w.connectToBroker() {
+				// Connection failed, wait before retrying (with cancellation check)
+				select {
+				case <-w.stopCh:
+					return
+				case <-time.After(w.options.ReconnectInterval):
+					continue
+				}
+			}
+			
+			// Start socket manager goroutine with current session ID
+			currentManagerID := w.getSocketManagerID()
+			if w.options.LogInfo {
+				log.Printf("MDP worker: starting socket manager session %d", currentManagerID)
+			}
+			go w.socketManager(currentManagerID)
 			
 			// Process messages (this will return on disconnect or error)
+			if w.options.LogInfo {
+				log.Printf("MDP worker: starting message processing loop")
+			}
 			w.processMessages()
 			
-			// Wait for socket manager to finish
-			<-w.socketDone
+			// Wait for socket manager to finish (with timeout)
+			select {
+			case <-w.socketDone:
+				// Socket manager finished normally
+			case <-time.After(2 * time.Second):
+				// Timeout - force close and continue
+				if w.options.LogErrors {
+					log.Printf("MDP worker: socket manager did not finish within timeout")
+				}
+			}
 			
 			// Check if we should continue running
 			running := w.queryState(queryIsRunning)
@@ -272,8 +376,13 @@ func (w *Worker) workerLoop() {
 				return
 			}
 			
-			// Wait before reconnecting
-			time.Sleep(w.options.ReconnectInterval)
+			// Wait before reconnecting (with cancellation check)
+			select {
+			case <-w.stopCh:
+				return
+			case <-time.After(w.options.ReconnectInterval):
+				// Continue with reconnection
+			}
 		}
 	}
 }
@@ -290,6 +399,7 @@ func (w *Worker) stateManager() {
 		replyTo        []byte
 		liveness       int
 		heartbeatAt    time.Time
+		socketReady    bool
 		totalRequests  uint64
 		totalReplies   uint64
 		totalErrors    uint64
@@ -316,6 +426,7 @@ func (w *Worker) stateManager() {
 				heartbeatAt = time.Now().Add(w.options.HeartbeatInterval)
 			case stateDisconnected:
 				connected = false
+				socketReady = false
 				expectReply = false
 				replyTo = nil
 			case stateExpectReply:
@@ -340,6 +451,12 @@ func (w *Worker) stateManager() {
 				if val, ok := update.data.(bool); ok {
 					running = val
 				}
+			case stateSetSocketReady:
+				if val, ok := update.data.(bool); ok {
+					socketReady = val
+				}
+			case stateSetSocketClosed:
+				socketReady = false
 			}
 			
 		case stats := <-w.statsUpdateCh:
@@ -368,6 +485,8 @@ func (w *Worker) stateManager() {
 				query.responseCh <- heartbeatAt
 			case queryGetLiveness:
 				query.responseCh <- liveness
+			case queryIsSocketReady:
+				query.responseCh <- socketReady
 			case queryGetStats:
 				stats := map[string]interface{}{
 					"service":         string(w.service),
@@ -383,6 +502,13 @@ func (w *Worker) stateManager() {
 			}
 		}
 	}
+}
+
+// getSocketManagerID returns the current socket manager ID
+func (w *Worker) getSocketManagerID() uint64 {
+	w.socketMu.RLock()
+	defer w.socketMu.RUnlock()
+	return w.socketManagerID
 }
 
 // Helper functions for channel-based updates
@@ -424,11 +550,31 @@ func (w *Worker) queryState(queryType queryType) interface{} {
 }
 
 // socketManager manages all socket operations in a single goroutine (thread-safe)
-func (w *Worker) socketManager() {
+func (w *Worker) socketManager(sessionID uint64) {
 	defer close(w.socketDone)
+	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: socketManager session %d started", sessionID)
+	}
+	
+	// Validate session ID to ensure this is the current socket manager
+	if sessionID != w.getSocketManagerID() {
+		if w.options.LogInfo {
+			log.Printf("MDP worker: socketManager session %d is obsolete, exiting", sessionID)
+		}
+		return
+	}
 	
 	// Use a single goroutine for all socket operations to ensure thread safety
 	for {
+		// Validate session ID on each iteration
+		if sessionID != w.getSocketManagerID() {
+			if w.options.LogInfo {
+				log.Printf("MDP worker: socketManager session %d invalidated, exiting", sessionID)
+			}
+			return
+		}
+		
 		// Check for send operations first (higher priority)
 		select {
 		case <-w.closeCh:
@@ -442,6 +588,14 @@ func (w *Worker) socketManager() {
 			return
 			
 		case msg := <-w.sendCh:
+			// Validate session before sending
+			if sessionID != w.getSocketManagerID() {
+				if w.options.LogInfo {
+					log.Printf("MDP worker: socketManager session %d invalidated during send", sessionID)
+				}
+				return
+			}
+			
 			// Send message to broker
 			if w.options.LogInfo && msg.command == WorkerReply {
 				log.Printf("MDP worker: socketManager received REPLY from sendCh")
@@ -463,29 +617,69 @@ func (w *Worker) socketManager() {
 			}
 			
 		default:
+			// Validate session before receiving
+			if sessionID != w.getSocketManagerID() {
+				if w.options.LogInfo {
+					log.Printf("MDP worker: socketManager session %d invalidated during receive", sessionID)
+				}
+				return
+			}
+			
 			// No send operations pending, try to receive
 			w.mu.RLock()
 			socket := w.socket
 			w.mu.RUnlock()
 			
 			if socket != nil {
-				// Use blocking receive
+				if w.options.LogInfo {
+					log.Printf("MDP worker: socket manager attempting socket.Recv() call")
+				}
+				
+				// Blocking recv call - simpler and more reliable than async pattern
 				msg, err := socket.Recv()
 				
+				if w.options.LogInfo {
+					if err != nil {
+						log.Printf("MDP worker: socket.Recv() returned error: %v", err)
+					} else {
+						log.Printf("MDP worker: socket.Recv() returned %d frames", len(msg.Frames))
+					}
+				}
+				
+				// Process the result immediately
 				if err != nil {
-					// Check if it's a timeout or real error
+					if w.options.LogInfo {
+						log.Printf("MDP worker: socket manager forwarding error to errorCh: %v", err)
+					}
 					select {
 					case w.errorCh <- err:
+						if w.options.LogInfo {
+							log.Printf("MDP worker: error sent to errorCh")
+						}
 					case <-w.closeCh:
+						if w.options.LogInfo {
+							log.Printf("MDP worker: socket manager cancelled during error handling")
+						}
 						return
 					default:
+						if w.options.LogInfo {
+							log.Printf("MDP worker: errorCh full, dropping error")
+						}
 					}
 				} else {
+					if w.options.LogInfo {
+						log.Printf("MDP worker: socket manager forwarding message to recvCh")
+					}
 					select {
 					case w.recvCh <- msg:
+						if w.options.LogInfo {
+							log.Printf("MDP worker: message sent to recvCh successfully")
+						}
 					case <-w.closeCh:
+						if w.options.LogInfo {
+							log.Printf("MDP worker: socket manager cancelled during message forwarding")
+						}
 						return
-					default:
 					}
 				}
 			} else {
@@ -497,31 +691,44 @@ func (w *Worker) socketManager() {
 }
 
 // connectToBroker connects to the broker and sends READY
-func (w *Worker) connectToBroker() {
+func (w *Worker) connectToBroker() bool {
 	connected := w.queryState(queryIsConnected)
 	if connected != nil && connected.(bool) {
-		return
+		return true
 	}
 	
-	// Close existing socket if any (done by socketManager now)
+	// Close existing socket if any
+	w.mu.Lock()
 	if w.socket != nil {
 		w.socket.Close()
 		w.socket = nil
 	}
+	w.mu.Unlock()
 	
-	// Recreate channels for new connection
-	w.sendCh = make(chan workerMessage, 10)
-	w.recvCh = make(chan zmq4.Msg, 10)
-	w.errorCh = make(chan error, 1)
-	w.closeCh = make(chan struct{})
-	w.socketDone = make(chan struct{})
+	// Initialize new socket channels for this connection session
+	w.initSocketChannels()
 	
-	// Create new DEALER socket with security if configured
+	// CRITICAL: Generate unique identity for ROUTER->DEALER routing
+	// This identity will be used by the broker to route messages back to this worker
+	workerIdentity := fmt.Sprintf("worker-%s-%d", w.service, time.Now().UnixNano())
+	workerIdentityBytes := []byte(workerIdentity)
+	
+	// Create new DEALER socket with identity and security if configured
 	var socket zmq4.Socket
 	if w.options.Security != nil {
-		socket = zmq4.NewDealer(w.ctx, zmq4.WithSecurity(w.options.Security))
+		if w.options.LogInfo {
+			log.Printf("MDP worker: creating DEALER socket with %s security and identity %s", w.options.Security.Type(), workerIdentity)
+		}
+		socket = zmq4.NewDealer(w.ctx, zmq4.WithID(zmq4.SocketIdentity(workerIdentityBytes)), zmq4.WithSecurity(w.options.Security))
 	} else {
-		socket = zmq4.NewDealer(w.ctx)
+		if w.options.LogInfo {
+			log.Printf("MDP worker: creating DEALER socket without security with identity %s", workerIdentity)
+		}
+		socket = zmq4.NewDealer(w.ctx, zmq4.WithID(zmq4.SocketIdentity(workerIdentityBytes)))
+	}
+	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: attempting to dial broker at %s", w.brokerEndpoint)
 	}
 	
 	err := socket.Dial(w.brokerEndpoint)
@@ -529,26 +736,149 @@ func (w *Worker) connectToBroker() {
 		if w.options.LogErrors {
 			log.Printf("MDP worker: failed to connect to broker %s: %v", w.brokerEndpoint, err)
 		}
-		time.Sleep(w.options.ReconnectInterval)
-		return
+		return false
 	}
 	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: socket dial successful, setting socket reference")
+	}
+	
+	w.mu.Lock()
 	w.socket = socket
+	w.mu.Unlock()
+	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: socket reference set, socket is ready for communication")
+	}
+	
 	w.updateState(stateConnected, nil)
 	w.updateStats(statsIncReconnects)
 	
+	// Validate CURVE security is ready for MESSAGE transmission if using CURVE
+	if w.options.Security != nil {
+		if err := w.validateSecurityReadiness(); err != nil {
+			if w.options.LogErrors {
+				log.Printf("MDP worker: security validation failed after connection: %v", err)
+			}
+			// Close the socket and fail the connection
+			w.mu.Lock()
+			if w.socket != nil {
+				w.socket.Close()
+				w.socket = nil
+			}
+			w.mu.Unlock()
+			w.updateState(stateSetSocketClosed, nil)
+			return false
+		}
+	}
+	
+	// Mark socket as ready for operations
+	if w.options.LogInfo {
+		log.Printf("MDP worker: marking socket as ready for operations")
+	}
+	w.updateState(stateSetSocketReady, true)
+	
+	// Wait briefly to ensure state update is processed
+	time.Sleep(10 * time.Millisecond)
+	
 	// Send READY message
+	if w.options.LogInfo {
+		log.Printf("MDP worker: sending READY message for service %s", w.service)
+	}
 	w.sendToBroker(WorkerReady, nil, []byte(w.service))
 	
 	if w.options.LogInfo {
 		log.Printf("MDP worker: connected to broker %s for service %s", w.brokerEndpoint, w.service)
 	}
+	
+	return true
+}
+
+// validateSecurityReadiness validates that the security mechanism is ready for MESSAGE operations
+func (w *Worker) validateSecurityReadiness() error {
+	if w.options.Security == nil {
+		return nil // No security, nothing to validate
+	}
+	
+	// Check if this is a CURVE security mechanism
+	if curveSec, ok := w.options.Security.(interface {
+		ValidateMessageReadiness() error
+	}); ok {
+		// Give CURVE a moment to finalize handshake state
+		time.Sleep(10 * time.Millisecond)
+		
+		return curveSec.ValidateMessageReadiness()
+	}
+	
+	// For other security mechanisms, just check basic readiness
+	if readySec, ok := w.options.Security.(interface {
+		IsReady() bool
+	}); ok {
+		if !readySec.IsReady() {
+			return fmt.Errorf("security mechanism not ready")
+		}
+	}
+	
+	return nil
+}
+
+// validateConnectionState performs comprehensive validation of connection state
+func (w *Worker) validateConnectionState() error {
+	// Check basic connection state
+	connected := w.queryState(queryIsConnected)
+	if connected == nil || !connected.(bool) {
+		return fmt.Errorf("worker not connected to broker")
+	}
+	
+	// Check socket readiness
+	socketReady := w.queryState(queryIsSocketReady)
+	if socketReady == nil || !socketReady.(bool) {
+		return fmt.Errorf("socket not ready for operations")
+	}
+	
+	// Check if we have a valid socket
+	w.mu.RLock()
+	socket := w.socket
+	w.mu.RUnlock()
+	
+	if socket == nil {
+		return fmt.Errorf("socket is nil")
+	}
+	
+	// Check socket manager is running
+	currentManagerID := w.getSocketManagerID()
+	if currentManagerID == 0 {
+		return fmt.Errorf("socket manager not initialized")
+	}
+	
+	// Validate security state if using security
+	if w.options.Security != nil {
+		if err := w.validateSecurityReadiness(); err != nil {
+			return fmt.Errorf("security validation failed: %w", err)
+		}
+	}
+	
+	// Check liveness
+	liveness := w.queryState(queryGetLiveness)
+	if liveness != nil && liveness.(int) <= 0 {
+		return fmt.Errorf("broker liveness exhausted")
+	}
+	
+	return nil
+}
+
+// isHealthy returns true if the worker connection is healthy
+func (w *Worker) isHealthy() bool {
+	return w.validateConnectionState() == nil
 }
 
 // processMessages processes messages from the broker via channels (thread-safe)
 func (w *Worker) processMessages() {
 	ticker := time.NewTicker(100 * time.Millisecond) // Check timeout frequently
 	defer ticker.Stop()
+	
+	healthCheckCounter := 0
+	const healthCheckInterval = 50 // Check health every 5 seconds (50 * 100ms)
 	
 	for {
 		select {
@@ -561,6 +891,20 @@ func (w *Worker) processMessages() {
 			return
 			
 		case <-ticker.C:
+			healthCheckCounter++
+			
+			// Periodic health check
+			if healthCheckCounter >= healthCheckInterval {
+				healthCheckCounter = 0
+				if err := w.validateConnectionState(); err != nil {
+					if w.options.LogErrors {
+						log.Printf("MDP worker: connection health check failed: %v", err)
+					}
+					w.disconnect()
+					return
+				}
+			}
+			
 			// Check if we need to send heartbeat
 			heartbeatTime := w.queryState(queryGetHeartbeatTime)
 			if heartbeatTime != nil && time.Now().After(heartbeatTime.(time.Time)) {
@@ -578,6 +922,15 @@ func (w *Worker) processMessages() {
 			}
 			
 		case msg := <-w.recvCh:
+			// Validate connection state before processing message
+			if err := w.validateConnectionState(); err != nil {
+				if w.options.LogErrors {
+					log.Printf("MDP worker: invalid connection state when receiving message: %v", err)
+				}
+				w.disconnect()
+				return
+			}
+			
 			if w.options.LogInfo {
 				log.Printf("MDP worker: received %d frames from broker", len(msg.Frames))
 			}
@@ -617,6 +970,17 @@ func (w *Worker) processMessage(msg zmq4.Msg) {
 	// Reset liveness - broker is alive
 	w.updateState(stateSetLiveness, w.options.HeartbeatLiveness)
 	
+	if w.options.LogInfo {
+		log.Printf("MDP worker: about to parse worker message with %d frames:", len(frames))
+		for i, frame := range frames {
+			if len(frame) > 0 {
+				log.Printf("  parse_frame[%d]: %q (len=%d, bytes=%v)", i, string(frame), len(frame), frame)
+			} else {
+				log.Printf("  parse_frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
+	
 	workerMsg, err := ParseWorkerMessage(frames)
 	if err != nil {
 		if w.options.LogErrors {
@@ -627,10 +991,14 @@ func (w *Worker) processMessage(msg zmq4.Msg) {
 	
 	if w.options.LogInfo {
 		log.Printf("MDP worker: received command 0x%02x from broker", []byte(workerMsg.Command)[0])
+		log.Printf("MDP worker: command string: %q, comparing to WorkerRequest %q", workerMsg.Command, WorkerRequest)
 	}
 	
 	switch workerMsg.Command {
 	case WorkerRequest:
+		if w.options.LogInfo {
+			log.Printf("MDP worker: processing REQUEST command")
+		}
 		w.processRequest(workerMsg)
 		
 	case WorkerHeartbeat:
@@ -653,6 +1021,7 @@ func (w *Worker) processMessage(msg zmq4.Msg) {
 func (w *Worker) processRequest(workerMsg *Message) {
 	if w.options.LogInfo {
 		log.Printf("MDP worker: ← received REQUEST from client %x (len=%d)", workerMsg.ClientAddr, len(workerMsg.Body))
+		log.Printf("MDP worker: request body: %q", string(workerMsg.Body))
 	}
 	
 	expectReply := w.queryState(queryGetExpectReply)
@@ -718,6 +1087,16 @@ func (w *Worker) sendReply(reply []byte) {
 
 // sendToBroker sends a message to the broker via channel (thread-safe)
 func (w *Worker) sendToBroker(command string, clientAddr []byte, body []byte) {
+	// Check if socket is ready for message transmission
+	socketReady := w.queryState(queryIsSocketReady)
+	if socketReady == nil || !socketReady.(bool) {
+		if w.options.LogErrors {
+			log.Printf("MDP worker: cannot send %s - socket not ready", command)
+		}
+		w.updateState(stateDecreaseLiveness, nil)
+		return
+	}
+	
 	if w.options.LogInfo && command == WorkerReply {
 		log.Printf("MDP worker: → sending REPLY to broker for client %x", clientAddr)
 	}
@@ -795,7 +1174,8 @@ func (w *Worker) sendHeartbeat() {
 	
 	w.sendToBroker(WorkerHeartbeat, nil, nil)
 	w.updateState(stateSetHeartbeatTime, time.Now().Add(w.options.HeartbeatInterval))
-	w.updateState(stateDecreaseLiveness, nil)
+	// Note: Heartbeat should EXTEND liveness, not decrease it
+	// The liveness is reset to full when we receive any message from broker
 }
 
 // disconnect disconnects from the broker via channel coordination (thread-safe)
@@ -805,6 +1185,8 @@ func (w *Worker) disconnect() {
 		return
 	}
 	
+	// Mark socket as not ready and disconnected
+	w.updateState(stateSetSocketClosed, nil)
 	w.updateState(stateDisconnected, nil)
 	
 	// Signal socket manager to close socket and exit (non-blocking)

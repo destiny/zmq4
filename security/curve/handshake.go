@@ -16,6 +16,8 @@ import (
 
 // clientHandshake performs the CURVE client-side handshake
 func (s *Security) clientHandshake(conn *zmq4.Conn) error {
+	logCurveEvent("HANDSHAKE_START", "Client handshake initiated")
+	
 	// Initialize handshake state
 	s.handshakeState = HandshakeInit
 	
@@ -28,39 +30,69 @@ func (s *Security) clientHandshake(conn *zmq4.Conn) error {
 	
 	// Step 2: Send HELLO command
 	s.handshakeState = HandshakeHello
+	logCurveEvent("HANDSHAKE_HELLO", "Sending HELLO command")
 	err = s.sendHello(conn)
 	if err != nil {
+		logCurveError("HANDSHAKE_HELLO", "Failed to send HELLO", err)
 		return fmt.Errorf("curve: failed to send HELLO: %w", err)
 	}
+	logCurveEvent("HANDSHAKE_HELLO", "HELLO command sent successfully")
 	
 	// Step 3: Receive WELCOME command
+	logCurveEvent("HANDSHAKE_WELCOME", "Waiting for WELCOME command")
 	err = s.recvWelcome(conn)
 	if err != nil {
+		logCurveError("HANDSHAKE_WELCOME", "Failed to receive WELCOME", err)
 		return fmt.Errorf("curve: failed to receive WELCOME: %w", err)
 	}
 	s.handshakeState = HandshakeWelcome
+	logCurveEvent("HANDSHAKE_WELCOME", "WELCOME command received successfully")
 	
 	// Step 4: Send INITIATE command
 	s.handshakeState = HandshakeInitiate
+	logCurveEvent("HANDSHAKE_INITIATE", "Sending INITIATE command")
 	err = s.sendInitiate(conn)
 	if err != nil {
+		logCurveError("HANDSHAKE_INITIATE", "Failed to send INITIATE", err)
 		return fmt.Errorf("curve: failed to send INITIATE: %w", err)
 	}
+	logCurveEvent("HANDSHAKE_INITIATE", "INITIATE command sent successfully")
 	
 	// Step 5: Receive READY command
+	logCurveEvent("HANDSHAKE_READY", "Waiting for READY command")
 	err = s.recvReady(conn)
 	if err != nil {
+		logCurveError("HANDSHAKE_READY", "Failed to receive READY", err)
 		return fmt.Errorf("curve: failed to receive READY: %w", err)
 	}
 	s.handshakeState = HandshakeReady
+	logCurveEvent("HANDSHAKE_READY", "READY command received successfully")
 	
 	// Handshake completed successfully
 	s.handshakeState = HandshakeComplete
+	logCurveEvent("HANDSHAKE_COMPLETE", "Client handshake completed successfully")
+	
+	// Initialize MESSAGE encryption state after successful handshake
+	// This is critical for the handshake-to-MESSAGE transition
+	s.mu.Lock()
+	// Initialize nonce counters properly for MESSAGE encryption
+	// According to RFC 26/CurveZMQ:
+	// - Server uses odd nonces starting from 1
+	// - Client uses even nonces starting from 2
+	// Reset to 0 so nextSendNonce() will initialize them correctly
+	s.serverNonce = 0  // Will be set to 1 by nextSendNonce() for servers
+	s.clientNonce = 0  // Will be set to 2 by nextSendNonce() for clients
+	s.messageEncryptionReady = true // Ready for MESSAGE encryption after handshake
+	s.mu.Unlock()
+	logCurveEvent("HANDSHAKE_POST_INIT", "MESSAGE encryption state initialized for client")
+	
 	return nil
 }
 
 // serverHandshake performs the CURVE server-side handshake
 func (s *Security) serverHandshake(conn *zmq4.Conn) error {
+	logCurveEvent("HANDSHAKE_START", "Server handshake initiated")
+	
 	// Initialize handshake state
 	s.handshakeState = HandshakeInit
 	
@@ -100,6 +132,22 @@ func (s *Security) serverHandshake(conn *zmq4.Conn) error {
 	
 	// Handshake completed successfully
 	s.handshakeState = HandshakeComplete
+	logCurveEvent("HANDSHAKE_COMPLETE", "Server handshake completed successfully")
+	
+	// Initialize MESSAGE encryption state after successful handshake
+	// This is critical for the handshake-to-MESSAGE transition
+	s.mu.Lock()
+	// Initialize nonce counters properly for MESSAGE encryption
+	// According to RFC 26/CurveZMQ:
+	// - Server uses odd nonces starting from 1
+	// - Client uses even nonces starting from 2
+	// Reset to 0 so nextSendNonce() will initialize them correctly
+	s.serverNonce = 0  // Will be set to 1 by nextSendNonce() for servers
+	s.clientNonce = 0  // Will be set to 2 by nextSendNonce() for clients
+	s.messageEncryptionReady = true // Ready for MESSAGE encryption after handshake
+	s.mu.Unlock()
+	logCurveEvent("HANDSHAKE_POST_INIT", "MESSAGE encryption state initialized for server")
+	
 	return nil
 }
 

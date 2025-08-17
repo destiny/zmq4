@@ -28,6 +28,7 @@ type BrokerWorker struct {
 	Identity []byte
 	Address  []byte
 	Expiry   time.Time
+	InstanceID string // Unique instance identifier for debugging
 	
 	// Statistics
 	RequestsProcessed uint64
@@ -41,9 +42,10 @@ func (w *BrokerWorker) IsExpired() bool {
 
 // Service represents a service with its worker queue
 type Service struct {
-	Name     ServiceName
-	Requests []*PendingRequest
-	Workers  []*BrokerWorker
+	Name             ServiceName
+	Requests         []*PendingRequest
+	AvailableWorkers []*BrokerWorker  // Workers ready to accept requests (single source of truth)
+	BusyWorkers      []*BrokerWorker  // Workers currently processing requests
 	
 	// Statistics
 	TotalRequests  uint64
@@ -104,7 +106,6 @@ type Broker struct {
 	// State management
 	services map[ServiceName]*Service
 	workers  map[string]*BrokerWorker // Key is worker identity as string
-	waiting  []*BrokerWorker          // Workers waiting for requests
 	
 	// Statistics
 	totalClients  uint64
@@ -140,7 +141,6 @@ func NewBroker(endpoint string, options *BrokerOptions) *Broker {
 		cancel:            cancel,
 		services:          make(map[ServiceName]*Service),
 		workers:           make(map[string]*BrokerWorker),
-		waiting:           make([]*BrokerWorker, 0),
 		stopCh:            make(chan struct{}),
 		workerCh:          make(chan *Message, 1000),
 		clientCh:          make(chan *Message, 1000),
@@ -234,17 +234,42 @@ func (b *Broker) Stop() error {
 
 // messageLoop handles incoming messages
 func (b *Broker) messageLoop() {
+	if b.options.LogInfo {
+		log.Printf("MDP broker: messageLoop started - listening for ALL incoming messages")
+	}
+	
 	for {
 		select {
 		case <-b.stopCh:
+			if b.options.LogInfo {
+				log.Printf("MDP broker: messageLoop stopping")
+			}
 			return
 		default:
+			if b.options.LogInfo {
+				log.Printf("MDP broker: calling socket.Recv() to wait for message")
+			}
+			
 			msg, err := b.socket.Recv()
 			if err != nil {
 				if b.running && b.options.LogErrors {
 					log.Printf("MDP broker recv error: %v", err)
 				}
 				continue
+			}
+			
+			if b.options.LogInfo {
+				log.Printf("MDP broker: ★ RECEIVED MESSAGE with %d frames", len(msg.Frames))
+				log.Printf("MDP broker: Raw message frames:")
+				for i, frame := range msg.Frames {
+					if i == 0 {
+						log.Printf("  frame[%d] (identity): %x -> %q (len=%d)", i, frame, string(frame), len(frame))
+					} else if len(frame) > 0 {
+						log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+					} else {
+						log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+					}
+				}
 			}
 			
 			b.processMessage(msg)
@@ -394,10 +419,19 @@ func (b *Broker) detectMessageType(workingFrames [][]byte, sender []byte) (int, 
 				if b.options.LogInfo {
 					log.Printf("MDP broker: detected worker message from %x", sender)
 				}
-				// Reconstruct message frames with proper separator
-				// Format: [empty][protocol][command][...]
+				// Reconstruct the complete worker message from all parts
+				// Format: [empty][protocol][command][client_addr][empty][body...]
 				messageFrames := [][]byte{{}} // Start with empty separator
+				
+				// Add the first part (protocol + command + client_addr)
 				messageFrames = append(messageFrames, part...)
+				
+				// Add remaining parts with empty separators between them
+				for i := 1; i < len(parts); i++ {
+					messageFrames = append(messageFrames, []byte{}) // Empty separator
+					messageFrames = append(messageFrames, parts[i]...)
+				}
+				
 				return messageTypeWorker, protocolFrame, messageFrames
 				
 			} else if protocolStr == ClientProtocol {
@@ -477,21 +511,53 @@ func (b *Broker) processWorkerMessage(identity []byte, frames [][]byte) {
 	defer b.mu.Unlock()
 	
 	worker, exists := b.workers[workerKey]
+	if b.options.LogInfo {
+		log.Printf("MDP broker: processing worker command %s - worker %s exists=%t", 
+			workerMsg.Command, workerKey[:8], exists)
+		if exists {
+			// Check if worker is in available list for logging
+			service := b.getOrCreateService(worker.Service)
+			available := b.isWorkerInAvailableList(worker, service)
+			log.Printf("MDP broker: worker %s state - Available=%t, InstanceID=%s, ptr=%p", 
+				workerKey[:8], available, worker.InstanceID, worker)
+		}
+	}
 	
 	switch workerMsg.Command {
 	case WorkerReady:
 		if exists {
 			// Worker sent READY when already registered - disconnect
+			if b.options.LogInfo {
+				// Check if worker is in available list for logging
+				service := b.getOrCreateService(worker.Service)
+				available := b.isWorkerInAvailableList(worker, service)
+				log.Printf("MDP broker: worker %x already exists - disconnecting (Available was %t, InstanceID was %s)", 
+					identity, available, worker.InstanceID)
+			}
 			b.disconnectWorker(worker, true)
 		} else {
 			// Register new worker
+			now := time.Now()
+			expiry := now.Add(b.heartbeatExpiry)
+			instanceID := fmt.Sprintf("worker-%d", now.UnixNano())
 			worker = &BrokerWorker{
 				ID:       WorkerID(identity),
 				Service:  workerMsg.Service,
 				Identity: identity,
 				Address:  identity,
-				Expiry:   time.Now().Add(b.heartbeatExpiry),
-				LastSeen: time.Now(),
+				Expiry:   expiry,
+				InstanceID: instanceID,
+				LastSeen: now,
+			}
+			
+			// Add worker to available list for this service
+			service := b.getOrCreateService(worker.Service)
+			service.AvailableWorkers = append(service.AvailableWorkers, worker)
+			service.ActiveWorkers++
+			
+			if b.options.LogInfo {
+				log.Printf("MDP broker: worker %x marked as Available = true (new registration), expires at %v (heartbeatExpiry=%v) instanceID=%s", 
+					identity, expiry, b.heartbeatExpiry, instanceID)
 			}
 			
 			b.workers[workerKey] = worker
@@ -514,7 +580,11 @@ func (b *Broker) processWorkerMessage(identity []byte, frames [][]byte) {
 			if b.options.LogErrors {
 				log.Printf("MDP broker: unknown worker %x sent reply - disconnecting", identity)
 			}
-			b.sendToWorker(identity, WorkerDisconnect, nil, nil)
+			if err := b.sendToWorker(identity, WorkerDisconnect, nil, nil); err != nil {
+				if b.options.LogErrors {
+					log.Printf("MDP broker: failed to send disconnect to unknown worker %x: %v", identity, err)
+				}
+			}
 		} else {
 			if b.options.LogInfo {
 				log.Printf("MDP broker: forwarding reply from worker %x to client %x", identity, workerMsg.ClientAddr)
@@ -526,20 +596,31 @@ func (b *Broker) processWorkerMessage(identity []byte, frames [][]byte) {
 			worker.RequestsProcessed++
 			b.totalReplies++
 			
-			// Worker is now available for more requests
-			b.addWorkerToWaiting(worker)
+			// Move worker from busy back to available
+			service := b.getOrCreateService(worker.Service)
+			b.moveWorkerToAvailable(worker, service)
 			if b.options.LogInfo {
-				log.Printf("MDP broker: worker %x now available for more requests", identity)
+				log.Printf("MDP broker: worker %x moved back to Available list (completed request) instanceID=%s", 
+					identity, worker.InstanceID)
 			}
 		}
 		
 	case WorkerHeartbeat:
 		if exists {
 			worker.LastSeen = time.Now()
+			oldExpiry := worker.Expiry
 			worker.Expiry = time.Now().Add(b.heartbeatExpiry)
+			if b.options.LogInfo {
+				log.Printf("MDP broker: worker %x heartbeat - updated expiry from %v to %v (heartbeatExpiry=%v)", 
+					identity, oldExpiry, worker.Expiry, b.heartbeatExpiry)
+			}
 		} else {
 			// Unknown worker - disconnect
-			b.sendToWorker(identity, WorkerDisconnect, nil, nil)
+			if err := b.sendToWorker(identity, WorkerDisconnect, nil, nil); err != nil {
+				if b.options.LogErrors {
+					log.Printf("MDP broker: failed to send disconnect to unknown worker %x: %v", identity, err)
+				}
+			}
 		}
 		
 	case WorkerDisconnect:
@@ -566,6 +647,33 @@ func (b *Broker) processClientMessage(identity []byte, frames [][]byte) {
 	// Get or create service
 	service := b.getOrCreateService(clientMsg.Service)
 	
+	// Debug: check worker state right before dispatching
+	if b.options.LogInfo {
+		totalAvailable := 0
+		now := time.Now()
+		log.Printf("MDP broker: CLIENT REQUEST RECEIVED for service %s at %v", clientMsg.Service, now)
+		for workerKey, w := range b.workers {
+			expired := w.IsExpired()
+			timeUntilExpiry := w.Expiry.Sub(now)
+			// Check if worker is available using list-based system
+			service := b.getOrCreateService(w.Service)
+			available := b.isWorkerInAvailableList(w, service)
+			if available && !expired {
+				totalAvailable++
+			}
+			log.Printf("MDP broker: worker %s - Available=%t, Expired=%t, TimeUntilExpiry=%v, Service=%s, InstanceID=%s", 
+				workerKey[:8], available, expired, timeUntilExpiry, w.Service, w.InstanceID)
+			
+			// Additional debug: check if service matches
+			if w.Service == clientMsg.Service {
+				log.Printf("MDP broker: worker %s serves matching service %s - Available=%t, Expired=%t", 
+					workerKey[:8], w.Service, available, expired)
+			}
+		}
+		log.Printf("MDP broker: about to dispatch for service %s - %d total workers, %d available", 
+			clientMsg.Service, len(b.workers), totalAvailable)
+	}
+	
 	// Create pending request
 	request := &PendingRequest{
 		Client:  identity,
@@ -578,6 +686,8 @@ func (b *Broker) processClientMessage(identity []byte, frames [][]byte) {
 	service.TotalRequests++
 	b.totalRequests++
 	
+	// The list-based system handles availability automatically
+	
 	// Try to dispatch immediately
 	b.dispatchRequests(service)
 	
@@ -586,8 +696,8 @@ func (b *Broker) processClientMessage(identity []byte, frames [][]byte) {
 	}
 }
 
-// sendToWorker sends a message to a worker
-func (b *Broker) sendToWorker(identity []byte, command string, clientAddr []byte, body []byte) {
+// sendToWorker sends a message to a worker and returns error if delivery fails
+func (b *Broker) sendToWorker(identity []byte, command string, clientAddr []byte, body []byte) error {
 	if b.options.LogInfo {
 		log.Printf("MDP broker: → sending %s (0x%02x) to worker %x", command, []byte(command)[0], identity)
 	}
@@ -613,12 +723,36 @@ func (b *Broker) sendToWorker(identity []byte, command string, clientAddr []byte
 	
 	zmqMsg := zmq4.NewMsgFrom(allFrames...)
 	
+	// Add comprehensive socket state diagnostic logging
+	if b.options.LogInfo && command == WorkerRequest {
+		log.Printf("MDP broker: about to call socket.Send() for REQUEST message to worker %x", identity)
+		log.Printf("MDP broker: socket type: %T", b.socket)
+		log.Printf("MDP broker: message frames being sent: %d", len(allFrames))
+		for i, frame := range allFrames {
+			if i == 0 {
+				log.Printf("  frame[%d] (ROUTER identity): %x (len=%d)", i, frame, len(frame))
+			} else if len(frame) > 0 {
+				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
+	
 	err := b.socket.Send(zmqMsg)
 	if err != nil {
 		log.Printf("MDP broker: failed to send to worker %x: %v", identity, err)
-	} else if b.options.LogInfo {
-		log.Printf("MDP broker: ✓ sent %s (0x%02x) to worker %x", command, []byte(command)[0], identity)
+		return fmt.Errorf("failed to send %s to worker %x: %w", command, identity, err)
 	}
+	
+	if b.options.LogInfo {
+		log.Printf("MDP broker: ✓ sent %s (0x%02x) to worker %x", command, []byte(command)[0], identity)
+		if command == WorkerRequest {
+			log.Printf("MDP broker: REQUEST message successfully transmitted through ROUTER socket")
+			log.Printf("MDP broker: socket.Send() returned nil error - message should be routed to worker")
+		}
+	}
+	return nil
 }
 
 // sendToClient sends a message to a client
@@ -630,10 +764,10 @@ func (b *Broker) sendToClient(identity []byte, service ServiceName, body []byte)
 	msg := NewClientReply(service, body)
 	frames := msg.FormatClientReply()
 	
-	// For ROUTER->REQ communication, prepend identity and empty frame for routing
-	allFrames := make([][]byte, 0, len(frames)+2)
+	// For ROUTER->REQ communication, prepend identity only
+	// FormatClientReply() already includes the empty delimiter frame
+	allFrames := make([][]byte, 0, len(frames)+1)
 	allFrames = append(allFrames, identity)
-	allFrames = append(allFrames, []byte{}) // Empty frame separator
 	allFrames = append(allFrames, frames...)
 	
 	zmqMsg := zmq4.NewMsgFrom(allFrames...)
@@ -659,63 +793,148 @@ func (b *Broker) sendToClient(identity []byte, service ServiceName, body []byte)
 
 // addWorkerToService adds a worker to a service
 func (b *Broker) addWorkerToService(worker *BrokerWorker) {
-	service := b.getOrCreateService(worker.Service)
-	service.Workers = append(service.Workers, worker)
-	service.ActiveWorkers++
-	
-	// Worker is initially available
-	b.addWorkerToWaiting(worker)
+	// Worker is already added to AvailableWorkers list during registration
+	// This function is kept for backward compatibility but does nothing now
 }
 
-// addWorkerToWaiting adds a worker to the waiting queue
-func (b *Broker) addWorkerToWaiting(worker *BrokerWorker) {
-	// Remove from waiting queue first (in case already there)
-	b.removeWorkerFromWaiting(worker)
-	
-	// Add to end of waiting queue
-	b.waiting = append(b.waiting, worker)
-}
-
-// removeWorkerFromWaiting removes a worker from the waiting queue
-func (b *Broker) removeWorkerFromWaiting(worker *BrokerWorker) {
-	for i, w := range b.waiting {
+// isWorkerInAvailableList checks if a worker is in the available list for its service
+func (b *Broker) isWorkerInAvailableList(worker *BrokerWorker, service *Service) bool {
+	for _, w := range service.AvailableWorkers {
 		if w == worker {
-			// Remove from slice
-			b.waiting = append(b.waiting[:i], b.waiting[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// moveWorkerToBusy moves a worker from available list to busy list
+func (b *Broker) moveWorkerToBusy(worker *BrokerWorker, service *Service) {
+	// Remove from available list
+	for i, w := range service.AvailableWorkers {
+		if w == worker {
+			service.AvailableWorkers = append(service.AvailableWorkers[:i], service.AvailableWorkers[i+1:]...)
 			break
 		}
 	}
+	
+	// Add to busy list
+	service.BusyWorkers = append(service.BusyWorkers, worker)
 }
+
+// moveWorkerToAvailable moves a worker from busy list to available list
+func (b *Broker) moveWorkerToAvailable(worker *BrokerWorker, service *Service) {
+	// Remove from busy list
+	for i, w := range service.BusyWorkers {
+		if w == worker {
+			service.BusyWorkers = append(service.BusyWorkers[:i], service.BusyWorkers[i+1:]...)
+			break
+		}
+	}
+	
+	// Add to available list (only if not already there)
+	if !b.isWorkerInAvailableList(worker, service) {
+		service.AvailableWorkers = append(service.AvailableWorkers, worker)
+	}
+}
+
 
 // getOrCreateService gets or creates a service
 func (b *Broker) getOrCreateService(name ServiceName) *Service {
 	service, exists := b.services[name]
 	if !exists {
 		service = &Service{
-			Name:     name,
-			Requests: make([]*PendingRequest, 0),
-			Workers:  make([]*BrokerWorker, 0),
+			Name:             name,
+			Requests:         make([]*PendingRequest, 0),
+			AvailableWorkers: make([]*BrokerWorker, 0),
+			BusyWorkers:      make([]*BrokerWorker, 0),
 		}
 		b.services[name] = service
 	}
 	return service
 }
 
-// dispatchRequests dispatches pending requests to available workers
+// getAvailableWorkersForService returns workers that are available and serve the specific service
+func (b *Broker) getAvailableWorkersForService(serviceName ServiceName) []*BrokerWorker {
+	service := b.getOrCreateService(serviceName)
+	
+	// Filter out expired workers from the available list
+	var availableWorkers []*BrokerWorker
+	for _, worker := range service.AvailableWorkers {
+		if !worker.IsExpired() {
+			availableWorkers = append(availableWorkers, worker)
+		}
+	}
+	
+	// Count total available workers across all services for logging
+	totalAvailable := 0
+	for _, svc := range b.services {
+		for _, worker := range svc.AvailableWorkers {
+			if !worker.IsExpired() {
+				totalAvailable++
+			}
+		}
+	}
+	
+	if b.options.LogInfo {
+		log.Printf("MDP broker: found %d total available workers, %d for service %s", 
+			totalAvailable, len(availableWorkers), serviceName)
+		for i, worker := range availableWorkers {
+			log.Printf("MDP broker: available[%d]: worker %x serves %s", i, worker.Identity, worker.Service)
+		}
+	}
+	
+	return availableWorkers
+}
+
+// dispatchRequests dispatches pending requests to available workers for this service
 func (b *Broker) dispatchRequests(service *Service) {
-	for len(service.Requests) > 0 && len(b.waiting) > 0 {
+	// Filter out expired workers from the available list first
+	var validWorkers []*BrokerWorker
+	for _, worker := range service.AvailableWorkers {
+		if !worker.IsExpired() {
+			validWorkers = append(validWorkers, worker)
+		}
+	}
+	service.AvailableWorkers = validWorkers
+	
+	if b.options.LogInfo {
+		log.Printf("MDP broker: dispatchRequests - service %s has %d pending requests, %d available workers", 
+			service.Name, len(service.Requests), len(service.AvailableWorkers))
+	}
+	
+	for len(service.Requests) > 0 && len(service.AvailableWorkers) > 0 {
 		// Get next request
 		request := service.Requests[0]
 		service.Requests = service.Requests[1:]
 		
-		// Get next available worker
-		worker := b.waiting[0]
-		b.waiting = b.waiting[1:]
+		// Get next available worker from the service's list
+		worker := service.AvailableWorkers[0]
 		
-		// Send request to worker
-		b.sendToWorker(worker.Identity, WorkerRequest, request.Client, request.Body)
+		// Move worker from available to busy list
+		b.moveWorkerToBusy(worker, service)
+		if b.options.LogInfo {
+			log.Printf("MDP broker: worker %x moved to Busy list (assigned request) at %v instanceID=%s", 
+				worker.Identity, time.Now(), worker.InstanceID)
+		}
 		
-			if b.options.LogInfo {
+		// Send request to worker - rollback availability if send fails
+		if b.options.LogInfo {
+			log.Printf("MDP broker: about to call sendToWorker with command %q (len=%d, bytes=%v)", 
+				WorkerRequest, len(WorkerRequest), []byte(WorkerRequest))
+		}
+		err := b.sendToWorker(worker.Identity, WorkerRequest, request.Client, request.Body)
+		if err != nil {
+			// Send failed - rollback worker from busy back to available
+			b.moveWorkerToAvailable(worker, service)
+			if b.options.LogErrors {
+				log.Printf("MDP broker: failed to send request to worker %x: %v", worker.Identity, err)
+			}
+			// Put request back at front of queue for retry with another worker
+			service.Requests = append([]*PendingRequest{request}, service.Requests...)
+			continue // Try next available worker
+		}
+		
+		if b.options.LogInfo {
 			log.Printf("MDP broker: dispatched request to worker %x for service %s", worker.Identity, service.Name)
 		}
 	}
@@ -724,25 +943,34 @@ func (b *Broker) dispatchRequests(service *Service) {
 // disconnectWorker disconnects a worker
 func (b *Broker) disconnectWorker(worker *BrokerWorker, send bool) {
 	if send {
-		b.sendToWorker(worker.Identity, WorkerDisconnect, nil, nil)
+		if err := b.sendToWorker(worker.Identity, WorkerDisconnect, nil, nil); err != nil {
+			if b.options.LogErrors {
+				log.Printf("MDP broker: failed to send disconnect to worker %x: %v", worker.Identity, err)
+			}
+		}
 	}
 	
 	// Remove from workers map
 	workerKey := string(worker.Identity)
 	delete(b.workers, workerKey)
 	
-	// Remove from waiting queue
-	b.removeWorkerFromWaiting(worker)
-	
-	// Remove from service
+	// Remove from service lists
 	if service, exists := b.services[worker.Service]; exists {
-		for i, w := range service.Workers {
+		// Remove from available workers list
+		for i, w := range service.AvailableWorkers {
 			if w == worker {
-				service.Workers = append(service.Workers[:i], service.Workers[i+1:]...)
-				service.ActiveWorkers--
+				service.AvailableWorkers = append(service.AvailableWorkers[:i], service.AvailableWorkers[i+1:]...)
 				break
 			}
 		}
+		// Remove from busy workers list
+		for i, w := range service.BusyWorkers {
+			if w == worker {
+				service.BusyWorkers = append(service.BusyWorkers[:i], service.BusyWorkers[i+1:]...)
+				break
+			}
+		}
+		service.ActiveWorkers--
 	}
 	
 	if b.options.LogInfo {
@@ -775,7 +1003,11 @@ func (b *Broker) sendHeartbeats() {
 	b.mu.RUnlock()
 	
 	for _, worker := range workers {
-		b.sendToWorker(worker.Identity, WorkerHeartbeat, nil, nil)
+		if err := b.sendToWorker(worker.Identity, WorkerHeartbeat, nil, nil); err != nil {
+			if b.options.LogErrors {
+				log.Printf("MDP broker: failed to send heartbeat to worker %x: %v", worker.Identity, err)
+			}
+		}
 	}
 }
 
@@ -799,25 +1031,46 @@ func (b *Broker) cleanup() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	
+	// Count total available workers across all services
+	totalAvailable := 0
+	for _, service := range b.services {
+		for _, w := range service.AvailableWorkers {
+			if !w.IsExpired() {
+				totalAvailable++
+			}
+		}
+	}
+	
+	if b.options.LogInfo {
+		log.Printf("MDP broker: cleanup running - %d workers, %d available", len(b.workers), totalAvailable)
+	}
+	
 	// Remove expired workers
 	for key, worker := range b.workers {
 		if worker.IsExpired() {
+			if b.options.LogInfo {
+				log.Printf("MDP broker: removing expired worker %x from service %s (expired at %v, now %v)", 
+					worker.Identity, worker.Service, worker.Expiry, time.Now())
+			}
 			delete(b.workers, key)
-			b.removeWorkerFromWaiting(worker)
 			
-			// Remove from service
+			// Remove from service lists
 			if service, exists := b.services[worker.Service]; exists {
-				for i, w := range service.Workers {
+				// Remove from available workers list
+				for i, w := range service.AvailableWorkers {
 					if w == worker {
-						service.Workers = append(service.Workers[:i], service.Workers[i+1:]...)
-						service.ActiveWorkers--
+						service.AvailableWorkers = append(service.AvailableWorkers[:i], service.AvailableWorkers[i+1:]...)
 						break
 					}
 				}
-			}
-			
-			if b.options.LogInfo {
-				log.Printf("MDP broker: expired worker %x from service %s", worker.Identity, worker.Service)
+				// Remove from busy workers list
+				for i, w := range service.BusyWorkers {
+					if w == worker {
+						service.BusyWorkers = append(service.BusyWorkers[:i], service.BusyWorkers[i+1:]...)
+						break
+					}
+				}
+				service.ActiveWorkers--
 			}
 		}
 	}
@@ -853,13 +1106,23 @@ func (b *Broker) GetStats() map[string]interface{} {
 		}
 	}
 	
+	// Count available workers across all services
+	availableWorkers := 0
+	for _, service := range b.services {
+		for _, worker := range service.AvailableWorkers {
+			if !worker.IsExpired() {
+				availableWorkers++
+			}
+		}
+	}
+	
 	return map[string]interface{}{
-		"total_clients":    b.totalClients,
-		"total_workers":    b.totalWorkers,
-		"total_requests":   b.totalRequests,
-		"total_replies":    b.totalReplies,
-		"active_workers":   len(b.workers),
-		"waiting_workers":  len(b.waiting),
-		"services":         serviceStats,
+		"total_clients":     b.totalClients,
+		"total_workers":     b.totalWorkers,
+		"total_requests":    b.totalRequests,
+		"total_replies":     b.totalReplies,
+		"active_workers":    len(b.workers),
+		"available_workers": availableWorkers,
+		"services":          serviceStats,
 	}
 }

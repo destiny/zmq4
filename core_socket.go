@@ -290,7 +290,7 @@ func (sck *socket) addConn(c *Conn) {
 	sck.conns = append(sck.conns, c)
 	if len(c.Peer.Meta[sysSockID]) == 0 {
 		switch c.typ {
-		case Router: // TODO: STREAM type when implemented
+		case Router: // STREAM type not yet implemented
 			// if empty Identity metadata is received from some client
 			// need to assign an uuid such that router socket can reply to the correct client
 			c.Peer.Meta[sysSockID] = newUUID()

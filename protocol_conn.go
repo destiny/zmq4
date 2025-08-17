@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var ErrClosedConn = errors.New("zmq4: read/write on closed connection")
@@ -399,8 +400,40 @@ func (c *Conn) sendMulti(msg Msg) error {
 }
 
 func (c *Conn) send(isCommand bool, body []byte, flag byte) error {
+	// For CURVE security and non-command messages (MESSAGEs), ensure connection is ready
+	if c.sec.Type() == CurveSecurity && !isCommand {
+		// Use enhanced readiness validation for CURVE MESSAGE encryption
+		if curveSec, ok := c.sec.(interface {
+			EnsureMessageReadiness(conn *Conn) error
+		}); ok {
+			if err := curveSec.EnsureMessageReadiness(c); err != nil {
+				c.checkIO(err)
+				return fmt.Errorf("zmq4: CURVE MESSAGE readiness check failed: %w", err)
+			}
+		}
+	}
+
+	// CRITICAL FIX: For CURVE security, handle empty frames correctly
+	// Empty frames are MDP protocol delimiters and should NOT be encrypted
+	var actualFrameSize int
+	if c.sec.Type() == CurveSecurity && !isCommand && len(body) > 0 {
+		// Only encrypt non-empty frames
+		// CURVE MESSAGE format: [flags][8-byte nonce][box]  
+		// where box = original_data + 16-byte auth tag
+		// Total CURVE MESSAGE size = 1 + 8 + len(body) + 16 = len(body) + 25
+		actualFrameSize = len(body) + 25
+		fmt.Printf("ZMTP_TRACE[%d]: CURVE_FRAME_SIZE - Original body: %d bytes, CURVE MESSAGE will be: %d bytes\n", 
+			time.Now().UnixMicro(), len(body), actualFrameSize)
+	} else {
+		// For empty frames or non-CURVE, use original size
+		actualFrameSize = len(body)
+		if len(body) == 0 {
+			fmt.Printf("ZMTP_TRACE[%d]: EMPTY_FRAME - Preserving empty frame as MDP delimiter\n", time.Now().UnixMicro())
+		}
+	}
+
 	// Long flag
-	size := len(body)
+	size := actualFrameSize  // Use actual frame size for ZMTP header
 	isLong := size > 255
 	if isLong {
 		flag ^= isLongBitFlag
@@ -415,7 +448,7 @@ func (c *Conn) send(isCommand bool, body []byte, flag byte) error {
 		hsz int
 	)
 
-	// Write out the message itself
+	// Write out the message header with correct size
 	if isLong {
 		hsz = 9
 		binary.BigEndian.PutUint64(hdr[1:], uint64(size))
@@ -423,14 +456,50 @@ func (c *Conn) send(isCommand bool, body []byte, flag byte) error {
 		hsz = 2
 		hdr[1] = uint8(size)
 	}
+	
+	timestamp := time.Now().UnixMicro()
+	fmt.Printf("ZMTP_TRACE[%d]: FRAME_HEADER_WRITE - Writing %d-byte frame header (size=%d)\n", timestamp, hsz, size)
+	
 	if _, err := c.rw.Write(hdr[:hsz]); err != nil {
+		fmt.Printf("ZMTP_ERROR[%d]: FRAME_HEADER_FAILED - Header write failed: %v\n", timestamp, err)
 		c.checkIO(err)
 		return err
 	}
+	
+	fmt.Printf("ZMTP_TRACE[%d]: FRAME_HEADER_SUCCESS - Header written successfully\n", timestamp)
 
-	if _, err := c.sec.Encrypt(c.rw, body); err != nil {
-		c.checkIO(err)
-		return err
+	// Handle encryption based on frame type and security
+	if c.sec.Type() == CurveSecurity && !isCommand && len(body) > 0 {
+		// Encrypt non-empty CURVE MESSAGEs
+		fmt.Printf("ZMTP_TRACE[%d]: CURVE_ENCRYPT_START - About to encrypt body: %d bytes\n", time.Now().UnixMicro(), len(body))
+		hasMore := (flag & hasMoreBitFlag) != 0
+		if curveSec, ok := c.sec.(interface {
+			EncryptWithFlags(w io.Writer, data []byte, hasMore bool) (int, error)
+		}); ok {
+			if _, err := curveSec.EncryptWithFlags(c.rw, body, hasMore); err != nil {
+				fmt.Printf("ZMTP_ERROR[%d]: CURVE_ENCRYPT_FAILED - EncryptWithFlags failed: %v\n", time.Now().UnixMicro(), err)
+				c.checkIO(err)
+				return err
+			}
+			fmt.Printf("ZMTP_TRACE[%d]: CURVE_ENCRYPT_SUCCESS - EncryptWithFlags completed\n", time.Now().UnixMicro())
+		} else {
+			if _, err := c.sec.Encrypt(c.rw, body); err != nil {
+				fmt.Printf("ZMTP_ERROR[%d]: CURVE_ENCRYPT_FAILED - Encrypt failed: %v\n", time.Now().UnixMicro(), err)
+				c.checkIO(err)
+				return err
+			}
+			fmt.Printf("ZMTP_TRACE[%d]: CURVE_ENCRYPT_SUCCESS - Encrypt completed\n", time.Now().UnixMicro())
+		}
+	} else if len(body) == 0 {
+		// For empty frames, write directly without encryption (MDP delimiters)
+		fmt.Printf("ZMTP_TRACE[%d]: EMPTY_FRAME_WRITE - Writing empty frame directly (no encryption)\n", time.Now().UnixMicro())
+		// Body is empty, nothing to write after header
+	} else {
+		// For non-CURVE or commands, use regular encryption
+		if _, err := c.sec.Encrypt(c.rw, body); err != nil {
+			c.checkIO(err)
+			return err
+		}
 	}
 
 	return nil
@@ -566,6 +635,9 @@ func (conn *Conn) subscribed(topic string) bool {
 
 func (conn *Conn) SetClosed() {
 	if wasClosed := atomic.CompareAndSwapInt32(&conn.closed, 0, 1); wasClosed {
+		// Log the socket closure event with timing
+		timestamp := time.Now().UnixMicro()
+		fmt.Printf("SOCKET_TRACE[%d]: SOCKET_CLOSED - Connection marked as closed\n", timestamp)
 		conn.notifyOnCloseError()
 	}
 }
@@ -579,14 +651,21 @@ func (conn *Conn) checkIO(err error) {
 		return
 	}
 
+	timestamp := time.Now().UnixMicro()
+	
 	if err == io.EOF || errors.Is(err, io.EOF) {
+		fmt.Printf("SOCKET_ERROR[%d]: IO_ERROR - EOF detected: %v\n", timestamp, err)
 		conn.SetClosed()
 		return
 	}
 
 	var e net.Error
 	if errors.As(err, &e); e != nil && !e.Timeout() {
+		fmt.Printf("SOCKET_ERROR[%d]: NETWORK_ERROR - Non-timeout network error: %v (temp=%v)\n", 
+			timestamp, err, e.Temporary())
 		conn.SetClosed()
+	} else {
+		fmt.Printf("SOCKET_ERROR[%d]: OTHER_ERROR - Error without connection close: %v\n", timestamp, err)
 	}
 }
 

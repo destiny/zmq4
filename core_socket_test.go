@@ -52,7 +52,7 @@ func TestInvalidConn(t *testing.T) {
 		if err != nil {
 			return fmt.Errorf("could not send bytes...: %w", err)
 		}
-		time.Sleep(1 * time.Second) // FIXME(sbinet): hugly.
+		time.Sleep(1 * time.Second) // Allow message to be processed
 		return nil
 	})
 

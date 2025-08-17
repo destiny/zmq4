@@ -75,7 +75,7 @@ func WithAutomaticReconnect(automaticReconnect bool) Option {
 }
 
 /*
-// TODO(sbinet)
+// Additional socket options for future implementation
 
 func WithIOThreads(threads int) Option {
 	return nil

@@ -81,21 +81,38 @@ func (c *Client) Connect() error {
 	// Create REQ socket for synchronous client with security if configured
 	var socket zmq4.Socket
 	if c.options.Security != nil {
+		if c.options.LogErrors {
+			log.Printf("MDP client: creating REQ socket with %s security", c.options.Security.Type())
+		}
 		socket = zmq4.NewReq(c.ctx, zmq4.WithSecurity(c.options.Security))
 	} else {
+		if c.options.LogErrors {
+			log.Printf("MDP client: creating REQ socket without security")
+		}
 		socket = zmq4.NewReq(c.ctx)
+	}
+	
+	if c.options.LogErrors {
+		log.Printf("MDP client: attempting to dial broker at %s", c.brokerEndpoint)
 	}
 	
 	err := socket.Dial(c.brokerEndpoint)
 	if err != nil {
+		if c.options.LogErrors {
+			log.Printf("MDP client: failed to dial broker %s: %v", c.brokerEndpoint, err)
+		}
 		return fmt.Errorf("mdp: failed to connect to broker: %w", err)
+	}
+	
+	if c.options.LogErrors {
+		log.Printf("MDP client: socket dial successful, setting socket reference")
 	}
 	
 	c.socket = socket
 	c.running = true
 	
 	if c.options.LogErrors {
-		log.Printf("MDP client connected to %s", c.brokerEndpoint)
+		log.Printf("MDP client: connected to %s, socket ready for requests", c.brokerEndpoint)
 	}
 	
 	return nil
@@ -134,11 +151,21 @@ func (c *Client) Request(service ServiceName, request []byte) ([]byte, error) {
 	c.mu.RUnlock()
 	
 	if !running {
+		if c.options.LogErrors {
+			log.Printf("MDP client: request failed - client not connected")
+		}
 		return nil, fmt.Errorf("mdp: client not connected")
 	}
 	
 	if err := service.Validate(); err != nil {
+		if c.options.LogErrors {
+			log.Printf("MDP client: request failed - invalid service name %s: %v", service, err)
+		}
 		return nil, fmt.Errorf("mdp: %w", err)
+	}
+	
+	if c.options.LogErrors {
+		log.Printf("MDP client: starting request to service %s (len=%d, retries=%d)", service, len(request), c.options.Retries)
 	}
 	
 	var lastErr error
@@ -154,6 +181,9 @@ func (c *Client) Request(service ServiceName, request []byte) ([]byte, error) {
 			c.totalRequests++
 			c.totalReplies++
 			c.mu.Unlock()
+			if c.options.LogErrors {
+				log.Printf("MDP client: ✓ request to %s successful (reply len=%d)", service, len(reply))
+			}
 			return reply, nil
 		}
 		
@@ -173,6 +203,9 @@ func (c *Client) Request(service ServiceName, request []byte) ([]byte, error) {
 		}
 	}
 	
+	if c.options.LogErrors {
+		log.Printf("MDP client: ✗ request to %s failed after %d attempts", service, c.options.Retries+1)
+	}
 	return nil, fmt.Errorf("mdp: request failed after %d attempts: %w", c.options.Retries+1, lastErr)
 }
 
@@ -182,11 +215,33 @@ func (c *Client) doRequest(service ServiceName, request []byte) ([]byte, error) 
 	msg := NewClientRequest(service, request)
 	frames := msg.FormatClientRequest()
 	
+	if c.options.LogErrors {
+		log.Printf("MDP client: formatting request message with %d frames:", len(frames))
+		for i, frame := range frames {
+			if len(frame) > 0 {
+				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+			} else {
+				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+			}
+		}
+	}
+	
 	zmqMsg := zmq4.NewMsgFrom(frames...)
+	
+	if c.options.LogErrors {
+		log.Printf("MDP client: about to call socket.Send() for request to %s", service)
+	}
 	
 	err := c.socket.Send(zmqMsg)
 	if err != nil {
+		if c.options.LogErrors {
+			log.Printf("MDP client: socket.Send() failed: %v", err)
+		}
 		return nil, fmt.Errorf("mdp: failed to send request: %w", err)
+	}
+	
+	if c.options.LogErrors {
+		log.Printf("MDP client: ✓ socket.Send() successful, request sent to broker")
 	}
 	
 	// Wait for reply with timeout
@@ -196,8 +251,30 @@ func (c *Client) doRequest(service ServiceName, request []byte) ([]byte, error) 
 	done := make(chan zmq4.Msg, 1)
 	errCh := make(chan error, 1)
 	
+	if c.options.LogErrors {
+		log.Printf("MDP client: waiting for reply (timeout=%v)", c.options.Timeout)
+		log.Printf("MDP client: starting socket.Recv() goroutine")
+	}
+	
 	go func() {
+		if c.options.LogErrors {
+			log.Printf("MDP client: socket.Recv() goroutine started, calling socket.Recv()")
+		}
 		msg, err := c.socket.Recv()
+		if c.options.LogErrors {
+			if err != nil {
+				log.Printf("MDP client: socket.Recv() returned error: %v", err)
+			} else {
+				log.Printf("MDP client: socket.Recv() returned %d frames successfully", len(msg.Frames))
+				for i, frame := range msg.Frames {
+					if len(frame) > 0 {
+						log.Printf("  client_frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+					} else {
+						log.Printf("  client_frame[%d]: <empty> (len=%d)", i, len(frame))
+					}
+				}
+			}
+		}
 		if err != nil {
 			errCh <- err
 		} else {
@@ -207,12 +284,21 @@ func (c *Client) doRequest(service ServiceName, request []byte) ([]byte, error) 
 	
 	select {
 	case msg := <-done:
+		if c.options.LogErrors {
+			log.Printf("MDP client: received reply with %d frames", len(msg.Frames))
+		}
 		return c.processReply(msg, service)
 		
 	case err := <-errCh:
+		if c.options.LogErrors {
+			log.Printf("MDP client: socket.Recv() failed: %v", err)
+		}
 		return nil, fmt.Errorf("mdp: failed to receive reply: %w", err)
 		
 	case <-ctx.Done():
+		if c.options.LogErrors {
+			log.Printf("MDP client: request timed out after %v", c.options.Timeout)
+		}
 		return nil, fmt.Errorf("mdp: request timeout after %v", c.options.Timeout)
 	}
 }
@@ -220,23 +306,39 @@ func (c *Client) doRequest(service ServiceName, request []byte) ([]byte, error) 
 // processReply processes a reply message
 func (c *Client) processReply(msg zmq4.Msg, expectedService ServiceName) ([]byte, error) {
 	if c.options.LogErrors {
-		log.Printf("MDP client: received %d frames:", len(msg.Frames))
+		log.Printf("MDP client: processReply called with %d frames:", len(msg.Frames))
 		for i, frame := range msg.Frames {
 			if len(frame) > 0 {
-				log.Printf("  frame[%d]: %q (len=%d)", i, string(frame), len(frame))
+				log.Printf("  reply_frame[%d]: %q (len=%d)", i, string(frame), len(frame))
 			} else {
-				log.Printf("  frame[%d]: <empty> (len=%d)", i, len(frame))
+				log.Printf("  reply_frame[%d]: <empty> (len=%d)", i, len(frame))
 			}
 		}
+		log.Printf("MDP client: about to call ParseClientMessage()")
 	}
 	
 	reply, err := ParseClientMessage(msg.Frames)
 	if err != nil {
+		if c.options.LogErrors {
+			log.Printf("MDP client: ParseClientMessage failed: %v", err)
+		}
 		return nil, fmt.Errorf("mdp: invalid reply message: %w", err)
 	}
 	
+	if c.options.LogErrors {
+		log.Printf("MDP client: ParseClientMessage successful, service=%s, body_len=%d", reply.Service, len(reply.Body))
+		log.Printf("MDP client: expected service=%s", expectedService)
+	}
+	
 	if reply.Service != expectedService {
+		if c.options.LogErrors {
+			log.Printf("MDP client: service mismatch - got %s, expected %s", reply.Service, expectedService)
+		}
 		return nil, fmt.Errorf("mdp: service mismatch in reply: got %s, expected %s", reply.Service, expectedService)
+	}
+	
+	if c.options.LogErrors {
+		log.Printf("MDP client: processReply successful, returning body: %q", string(reply.Body))
 	}
 	
 	return reply.Body, nil
