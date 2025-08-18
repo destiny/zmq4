@@ -36,8 +36,9 @@ type Conn struct {
 	mu     sync.RWMutex
 	topics map[string]struct{} // set of subscribed topics
 
-	closed         int32
-	onCloseErrorCB func(c *Conn)
+	closed             int32
+	onCloseErrorCB     func(c *Conn)
+	heartbeatNotifyCB  func(updateType, connID string, timestamp time.Time, data interface{}) // Heartbeat callback
 }
 
 func (c *Conn) Close() error {
@@ -165,12 +166,7 @@ func (c *Conn) SendCmd(name string, body []byte) error {
 	if c.Closed() {
 		return ErrClosedConn
 	}
-	cmd := Cmd{Name: name, Body: body}
-	buf, err := cmd.marshalZMTP()
-	if err != nil {
-		return err
-	}
-	return c.sendCmd(name, buf)
+	return c.sendCmd(name, body)
 }
 
 // sendCmd handles command sending with appropriate encryption based on security mechanism
@@ -187,8 +183,15 @@ func (c *Conn) sendCmd(cmdName string, body []byte) error {
 		}
 	}
 	
+	// Marshal the command properly
+	cmd := Cmd{Name: cmdName, Body: body}
+	buf, err := cmd.marshalZMTP()
+	if err != nil {
+		return err
+	}
+	
 	// Use regular send for all other commands and messages
-	return c.send(true, body, 0)
+	return c.send(true, buf, 0)
 }
 
 // isCurveHandshakeCommand checks if a command is part of the CURVE handshake
@@ -271,6 +274,13 @@ func (c *Conn) RecvMsg() (Msg, error) {
 	if c.Closed() {
 		return Msg{}, ErrClosedConn
 	}
+	
+	// Notify heartbeat manager of activity
+	if c.heartbeatNotifyCB != nil {
+		connID := c.rw.RemoteAddr().String()
+		c.heartbeatNotifyCB("activity", connID, time.Now(), nil)
+	}
+	
 	msg := c.read()
 	if msg.err != nil {
 		return msg, fmt.Errorf("zmq4: could not read recv msg: %w", msg.err)
@@ -299,10 +309,28 @@ func (c *Conn) RecvMsg() (Msg, error) {
 
 	switch cmd.Name {
 	case CmdPing:
-		// send back a PONG immediately.
-		msg.err = c.SendCmd(CmdPong, nil)
+		// Handle PING per RFC 37: ping = command-size %d4 "PING" ping-ttl ping-context
+		// Respond with PONG containing the same context
+		var pongBody []byte
+		if len(cmd.Body) >= 2 {
+			// Extract context (everything after the 2-byte TTL)
+			if len(cmd.Body) > 2 {
+				context := cmd.Body[2:]
+				if len(context) <= 16 { // RFC 37: max 16 octets context
+					pongBody = context
+				}
+			}
+		}
+		// Send back a PONG immediately with the context
+		msg.err = c.SendCmd(CmdPong, pongBody)
 		if msg.err != nil {
 			return msg, msg.err
+		}
+	case CmdPong:
+		// PONG received - connection is alive
+		if c.heartbeatNotifyCB != nil {
+			connID := c.rw.RemoteAddr().String()
+			c.heartbeatNotifyCB("pong", connID, time.Now(), nil)
 		}
 	}
 

@@ -74,6 +74,36 @@ func WithAutomaticReconnect(automaticReconnect bool) Option {
 	}
 }
 
+// WithHeartbeatIVL sets the interval between sending ZMTP heartbeats (PING commands).
+// If this option is set and is greater than 0, then a PING ZMTP command will be sent
+// every heartbeatIVL milliseconds. Per RFC 37/ZMTP 3.1.
+func WithHeartbeatIVL(heartbeatIVL time.Duration) Option {
+	return func(s *socket) {
+		s.SetOption(OptionHeartbeatIVL, heartbeatIVL)
+	}
+}
+
+// WithHeartbeatTTL sets the timeout on the remote peer for ZMTP heartbeats.
+// If this option is greater than 0, the remote side shall time out the connection
+// if it does not receive any more traffic within the TTL period.
+// TTL is specified in deciseconds (1/10th second) with max value 6553.5 seconds.
+// Per RFC 37/ZMTP 3.1.
+func WithHeartbeatTTL(heartbeatTTL time.Duration) Option {
+	return func(s *socket) {
+		s.SetOption(OptionHeartbeatTTL, heartbeatTTL)
+	}
+}
+
+// WithHeartbeatTimeout sets how long to wait before timing-out a connection
+// after sending a PING ZMTP command and not receiving any traffic.
+// This option is only valid if heartbeat interval is also set and greater than 0.
+// Per RFC 37/ZMTP 3.1.
+func WithHeartbeatTimeout(heartbeatTimeout time.Duration) Option {
+	return func(s *socket) {
+		s.SetOption(OptionHeartbeatTimeout, heartbeatTimeout)
+	}
+}
+
 /*
 // Additional socket options for future implementation
 
@@ -94,4 +124,9 @@ const (
 	OptionSubscribe   = "SUBSCRIBE"
 	OptionUnsubscribe = "UNSUBSCRIBE"
 	OptionHWM         = "HWM"
+	
+	// ZMTP 3.1 Heartbeat Options (RFC 37)
+	OptionHeartbeatIVL     = "ZMQ_HEARTBEAT_IVL"     // Interval between PING commands (milliseconds)
+	OptionHeartbeatTTL     = "ZMQ_HEARTBEAT_TTL"     // Timeout for remote peer (deciseconds, max 6553.5s)
+	OptionHeartbeatTimeout = "ZMQ_HEARTBEAT_TIMEOUT" // Local timeout after sending PING (milliseconds)
 )
