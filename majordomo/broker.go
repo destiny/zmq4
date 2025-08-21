@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/destiny/zmq4/v25"
+	zmq4 "github.com/destiny/zmq4/v25"
 )
 
 // Message type constants for frame analysis
@@ -72,6 +72,9 @@ type BrokerOptions struct {
 	HeartbeatInterval time.Duration // Heartbeat interval
 	RequestTimeout    time.Duration // Request timeout
 	Security          zmq4.Security // Security mechanism (nil for no security)
+	LogLevel          zmq4.LogLevel // Logging level (replaces LogErrors/LogInfo)
+	
+	// Deprecated: Use LogLevel instead
 	LogErrors         bool          // Whether to log errors
 	LogInfo           bool          // Whether to log info messages
 }
@@ -83,6 +86,8 @@ func DefaultBrokerOptions() *BrokerOptions {
 		HeartbeatInterval: DefaultHeartbeatInterval,
 		RequestTimeout:    30 * time.Second,
 		Security:          nil,
+		LogLevel:          zmq4.LogLevelWarn, // Default to WARN level
+		// Backward compatibility
 		LogErrors:         true,
 		LogInfo:           false,
 	}
@@ -113,6 +118,9 @@ type Broker struct {
 	totalRequests uint64
 	totalReplies  uint64
 	
+	// Logging
+	logger     *zmq4.Logger
+	
 	// Synchronization
 	mu         sync.RWMutex
 	running    bool
@@ -130,6 +138,22 @@ func NewBroker(endpoint string, options *BrokerOptions) *Broker {
 	
 	ctx, cancel := context.WithCancel(context.Background())
 	
+	// Initialize logger based on options
+	var logger *zmq4.Logger
+	if options.LogLevel != 0 {
+		// Use new LogLevel
+		logger = zmq4.NewLogger(options.LogLevel)
+	} else {
+		// Backward compatibility with boolean flags
+		if options.LogInfo {
+			logger = zmq4.NewLogger(zmq4.LogLevelInfo)
+		} else if options.LogErrors {
+			logger = zmq4.NewLogger(zmq4.LogLevelError)
+		} else {
+			logger = zmq4.DevNullLogger
+		}
+	}
+	
 	return &Broker{
 		endpoint:          endpoint,
 		heartbeatLiveness: options.HeartbeatLiveness,
@@ -137,6 +161,7 @@ func NewBroker(endpoint string, options *BrokerOptions) *Broker {
 		heartbeatExpiry:   options.HeartbeatInterval * time.Duration(options.HeartbeatLiveness),
 		requestTimeout:    options.RequestTimeout,
 		options:           options,
+		logger:            logger,
 		ctx:               ctx,
 		cancel:            cancel,
 		services:          make(map[ServiceName]*Service),
@@ -196,12 +221,10 @@ func (b *Broker) Start() error {
 	go b.messageLoop()
 	go b.cleanupLoop()
 	
-	if b.options.LogInfo {
-		if b.options.Security != nil {
-			log.Printf("MDP broker started on %s with %s security", b.endpoint, b.options.Security.Type())
-		} else {
-			log.Printf("MDP broker started on %s", b.endpoint)
-		}
+	if b.options.Security != nil {
+		b.logger.Info("MDP broker started on %s with %s security", b.endpoint, b.options.Security.Type())
+	} else {
+		b.logger.Info("MDP broker started on %s", b.endpoint)
 	}
 	return nil
 }
@@ -226,24 +249,18 @@ func (b *Broker) Stop() error {
 		}
 	}
 	
-	if b.options.LogInfo {
-		log.Printf("MDP broker stopped")
-	}
+	b.logger.Info("MDP broker stopped")
 	return nil
 }
 
 // messageLoop handles incoming messages
 func (b *Broker) messageLoop() {
-	if b.options.LogInfo {
-		log.Printf("MDP broker: messageLoop started - listening for ALL incoming messages")
-	}
+	b.logger.Debug("MDP broker: messageLoop started - listening for ALL incoming messages")
 	
 	for {
 		select {
 		case <-b.stopCh:
-			if b.options.LogInfo {
-				log.Printf("MDP broker: messageLoop stopping")
-			}
+			b.logger.Debug("MDP broker: messageLoop stopping")
 			return
 		default:
 			if b.options.LogInfo {
@@ -252,8 +269,8 @@ func (b *Broker) messageLoop() {
 			
 			msg, err := b.socket.Recv()
 			if err != nil {
-				if b.running && b.options.LogErrors {
-					log.Printf("MDP broker recv error: %v", err)
+				if b.running {
+					b.logger.Error("MDP broker recv error: %v", err)
 				}
 				continue
 			}
@@ -281,7 +298,7 @@ func (b *Broker) messageLoop() {
 func (b *Broker) processMessage(msg zmq4.Msg) {
 	frames := msg.Frames
 	if len(frames) < 1 {
-		log.Printf("MDP broker: empty message received")
+		b.logger.Warn("MDP broker: empty message received")
 		return
 	}
 	

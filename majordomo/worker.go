@@ -89,6 +89,9 @@ type WorkerOptions struct {
 	HeartbeatInterval time.Duration // Heartbeat interval
 	ReconnectInterval time.Duration // Reconnection interval
 	Security          zmq4.Security // Security mechanism (nil for no security)
+	LogLevel          zmq4.LogLevel // Logging level (replaces LogErrors/LogInfo)
+	
+	// Deprecated: Use LogLevel instead
 	LogErrors         bool          // Whether to log errors
 	LogInfo           bool          // Whether to log info messages
 }
@@ -100,6 +103,8 @@ func DefaultWorkerOptions() *WorkerOptions {
 		HeartbeatInterval: DefaultHeartbeatInterval,
 		ReconnectInterval: 2500 * time.Millisecond,
 		Security:          nil,
+		LogLevel:          zmq4.LogLevelWarn, // Default to WARN level
+		// Backward compatibility
 		LogErrors:         true,
 		LogInfo:           false,
 	}
@@ -117,6 +122,9 @@ type Worker struct {
 	socket   zmq4.Socket
 	ctx      context.Context
 	cancel   context.CancelFunc
+	
+	// Logging
+	logger          *zmq4.Logger
 	
 	// State management
 	mu              sync.RWMutex
@@ -170,11 +178,28 @@ func NewWorker(service ServiceName, brokerEndpoint string, handler RequestHandle
 	
 	ctx, cancel := context.WithCancel(context.Background())
 	
+	// Initialize logger based on options
+	var logger *zmq4.Logger
+	if options.LogLevel != 0 {
+		// Use new LogLevel
+		logger = zmq4.NewLogger(options.LogLevel)
+	} else {
+		// Backward compatibility with boolean flags
+		if options.LogInfo {
+			logger = zmq4.NewLogger(zmq4.LogLevelInfo)
+		} else if options.LogErrors {
+			logger = zmq4.NewLogger(zmq4.LogLevelError)
+		} else {
+			logger = zmq4.DevNullLogger
+		}
+	}
+	
 	w := &Worker{
 		service:        service,
 		brokerEndpoint: brokerEndpoint,
 		options:        options,
 		handler:        handler,
+		logger:         logger,
 		ctx:            ctx,
 		cancel:         cancel,
 		liveness:       options.HeartbeatLiveness,

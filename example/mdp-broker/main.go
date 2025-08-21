@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/destiny/zmq4/v25/majordomo"
+	zmq4 "github.com/destiny/zmq4/v25"
 )
 
 func main() {
@@ -22,6 +23,9 @@ func main() {
 	options.HeartbeatLiveness = 3
 	options.HeartbeatInterval = 2500 * time.Millisecond
 	options.RequestTimeout = 30 * time.Second
+	// Use new logging system - set to INFO level for development
+	options.LogLevel = zmq4.LogLevelInfo
+	// Keep backward compatibility flag for now
 	options.LogInfo = true
 	
 	broker := majordomo.NewBroker("tcp://*:5555", options)

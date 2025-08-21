@@ -19,6 +19,9 @@ type ClientOptions struct {
 	Timeout   time.Duration // Request timeout
 	Retries   int           // Number of retries
 	Security  zmq4.Security // Security mechanism (nil for no security)
+	LogLevel  zmq4.LogLevel // Logging level (replaces LogErrors)
+	
+	// Deprecated: Use LogLevel instead
 	LogErrors bool          // Whether to log errors
 }
 
@@ -28,6 +31,8 @@ func DefaultClientOptions() *ClientOptions {
 		Timeout:   30 * time.Second,
 		Retries:   3,
 		Security:  nil,
+		LogLevel:  zmq4.LogLevelWarn, // Default to WARN level
+		// Backward compatibility
 		LogErrors: true,
 	}
 }
@@ -42,6 +47,9 @@ type Client struct {
 	socket zmq4.Socket
 	ctx    context.Context
 	cancel context.CancelFunc
+	
+	// Logging
+	logger  *zmq4.Logger
 	
 	// State
 	mu      sync.RWMutex
@@ -61,9 +69,24 @@ func NewClient(brokerEndpoint string, options *ClientOptions) *Client {
 	
 	ctx, cancel := context.WithCancel(context.Background())
 	
+	// Initialize logger based on options
+	var logger *zmq4.Logger
+	if options.LogLevel != 0 {
+		// Use new LogLevel
+		logger = zmq4.NewLogger(options.LogLevel)
+	} else {
+		// Backward compatibility with boolean flags
+		if options.LogErrors {
+			logger = zmq4.NewLogger(zmq4.LogLevelError)
+		} else {
+			logger = zmq4.DevNullLogger
+		}
+	}
+	
 	return &Client{
 		brokerEndpoint: brokerEndpoint,
 		options:        options,
+		logger:         logger,
 		ctx:            ctx,
 		cancel:         cancel,
 	}

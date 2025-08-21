@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/destiny/zmq4/v25/majordomo"
+	zmq4 "github.com/destiny/zmq4/v25"
 )
 
 func main() {
@@ -45,6 +46,8 @@ func main() {
 		HeartbeatLiveness: 3,
 		HeartbeatInterval: 2500 * time.Millisecond,
 		ReconnectInterval: 2500 * time.Millisecond,
+		LogLevel:          zmq4.LogLevelInfo, // Use new logging system
+		// Keep backward compatibility flags for now
 		LogErrors:         true,
 		LogInfo:           true,
 	}
