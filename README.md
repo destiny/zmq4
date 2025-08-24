@@ -1,151 +1,53 @@
-# zmq4
+# ZMQ4 - Pure Go Implementation of ØMQ 4.x
 
-[![GitHub release](https://img.shields.io/github/release/destiny/zmq4.svg)](https://github.com/destiny/zmq4/releases)
-[![go.dev reference](https://pkg.go.dev/badge/github.com/destiny/zmq4/v25)](https://pkg.go.dev/github.com/destiny/zmq4/v25)
-[![CI](https://github.com/destiny/zmq4/workflows/CI/badge.svg)](https://github.com/destiny/zmq4/actions)
-[![codecov](https://codecov.io/gh/destiny/zmq4/branch/main/graph/badge.svg)](https://codecov.io/gh/destiny/zmq4)
+[![Go Report Card](https://goreportcard.com/badge/github.com/destiny/zmq4)](https://goreportcard.com/report/github.com/destiny/zmq4)
 [![GoDoc](https://godoc.org/github.com/destiny/zmq4/v25?status.svg)](https://godoc.org/github.com/destiny/zmq4/v25)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Go Report Card](https://goreportcard.com/badge/github.com/destiny/zmq4)](https://goreportcard.com/report/github.com/destiny/zmq4)
 
-`zmq4` is a **production-ready, RFC-compliant** pure-Go implementation of ØMQ (ZeroMQ), version 4 with comprehensive security features and head-to-head C compatibility.
+**ZMQ4** is a comprehensive, production-ready pure-Go implementation of ØMQ (ZeroMQ) version 4.x with complete protocol support, security features, and high-level messaging patterns.
 
-## Key Features
+## 🚀 Key Features
 
-✅ **Complete RFC Compliance**
-- Z85 Encoding (RFC 32) with 90.5% test coverage
-- CURVE Security (RFC 25/26) with full handshake protocol
-- Majordomo Pattern (RFC 7) with broker, client, and worker
+### ✅ **Complete Protocol Support**
+- **Core ØMQ Patterns**: REQ/REP, DEALER/ROUTER, PUB/SUB, PUSH/PULL, PAIR, XPUB/XSUB
+- **High-Level Protocols**: Zyre (proximity P2P), Dafka (decentralized streaming), Malamute (enterprise messaging)
+- **Majordomo Pattern (MDP)**: Service-oriented architecture with brokers, workers, and clients
 
-✅ **Enterprise Security**
-- CurveZMQ with anti-amplification protection
-- Curve25519 elliptic curve cryptography
-- Stateless server operation with cookie mechanism
-- Production-ready security verified against C implementations
+### ✅ **Enterprise Security**
+- **CURVE Security**: Elliptic curve cryptography with Curve25519
+- **PLAIN Authentication**: Username/password authentication
+- **NULL Security**: No authentication (development/testing)
+- Complete handshake protocols with anti-amplification protection
 
-✅ **Complete Socket Coverage**
-- All ZeroMQ socket types: REQ/REP, DEALER/ROUTER, PUB/SUB, PUSH/PULL, PAIR, XPUB/XSUB
-- Head-to-head compatibility with C ZeroMQ
-- Verified interoperability with existing ZeroMQ infrastructure
+### ✅ **Production Ready**
+- Pure Go implementation - no C dependencies
+- Comprehensive test coverage with black-box testing
+- Memory-efficient and high-performance
+- Cross-platform compatibility (Linux, macOS, Windows)
+- Thread-safe concurrent operations
 
-✅ **High Performance**
-- Z85 encoding: 15.64 ns/op encode, 41.03 ns/op decode
-- Comprehensive test coverage with benchmarks
-- Memory-efficient implementations
-
-## Enhanced Implementation
-
-This is a thoroughly tested and enhanced implementation that extends beyond the original [go-zeromq/zmq4](https://github.com/go-zeromq/zmq4) with:
-- Complete security protocol implementations
-- RFC compliance verification
-- Production-ready Majordomo pattern
-- Extensive interoperability testing
-- Active maintenance and improvements
-
-## Installation
-
-To use the latest stable version of zmq4 in your Go project:
+## 📦 Installation
 
 ```bash
 go get github.com/destiny/zmq4/v25
 ```
-
-### Versioning Scheme
-
-This project uses a **YY.Q.NN** versioning format:
-- **YY**: Year (e.g., 25 for 2025)
-- **Q**: Quarter (1-4)
-- **NN**: Sequence number within the quarter
-
-Example: `v25.3.2` means the 2nd release in Q3 of 2025.
 
 ### Import in Your Code
 
 ```go
 import "github.com/destiny/zmq4/v25"
 
-// Or with alias
-import zmq "github.com/destiny/zmq4/v25"
+// For specific protocols
+import "github.com/destiny/zmq4/v25/zyre"      // Proximity P2P
+import "github.com/destiny/zmq4/v25/dafka"     // Decentralized streaming  
+import "github.com/destiny/zmq4/v25/malamute"  // Enterprise messaging
+import "github.com/destiny/zmq4/v25/majordomo" // Service-oriented pattern
+import "github.com/destiny/zmq4/v25/security/curve" // CURVE security
 ```
 
-### Subpackages
+## 🏁 Quick Start
 
-For specific functionality, import the relevant subpackages:
-
-```go
-import "github.com/destiny/zmq4/v25/security/curve"  // CURVE security
-import "github.com/destiny/zmq4/v25/majordomo"      // Majordomo Pattern
-import "github.com/destiny/zmq4/v25/z85"            // Z85 encoding
-```
-
-## Getting Started
-
-### Common Use Cases
-
-**1. Request-Reply Pattern** - For client-server communication:
-```go
-// Server
-server := zmq4.NewRep(ctx)
-server.Listen("tcp://*:5555")
-
-// Client  
-client := zmq4.NewReq(ctx)
-client.Dial("tcp://localhost:5555")
-```
-
-**2. Publish-Subscribe Pattern** - For broadcasting:
-```go
-// Publisher
-pub := zmq4.NewPub(ctx)
-pub.Bind("tcp://*:5556")
-
-// Subscriber
-sub := zmq4.NewSub(ctx)
-sub.SetOption(zmq4.OptionSubscribe, "topic")
-sub.Connect("tcp://localhost:5556")
-```
-
-**3. Secure Communication with CURVE**:
-```go
-import "github.com/destiny/zmq4/v25/security/curve"
-
-// Generate key pair
-public, private, _ := curve.GenerateKeypair()
-
-// Server with CURVE
-security := curve.NewSecurity("", public, private)
-server := zmq4.NewRep(ctx, zmq4.WithSecurity(security))
-```
-
-**4. Majordomo Pattern** - For service-oriented architecture:
-```go
-import "github.com/destiny/zmq4/v25/majordomo"
-
-// Broker
-broker := majordomo.NewBroker("tcp://*:5555", nil)
-broker.Start()
-
-// Worker
-worker := majordomo.NewWorker("echo", "tcp://localhost:5555", handler, nil)
-worker.Start()
-
-// Client
-client := majordomo.NewClient("tcp://localhost:5555", nil)
-reply, _ := client.Request("echo", []byte("Hello"))
-```
-
-### Choosing the Right Pattern
-
-- **REQ/REP**: Synchronous request-reply, one-to-one
-- **DEALER/ROUTER**: Asynchronous request-reply, load balancing
-- **PUB/SUB**: One-to-many broadcasting, fire-and-forget
-- **PUSH/PULL**: Load distribution, pipeline processing
-- **PAIR**: Exclusive pair connection
-- **Majordomo**: Service-oriented with automatic service discovery
-
-## Quick Example
-
-Here's a simple client-server example:
+### Basic Request-Reply Pattern
 
 ```go
 package main
@@ -153,13 +55,13 @@ package main
 import (
     "context"
     "fmt"
-    
     "github.com/destiny/zmq4/v25"
 )
 
 func main() {
-    // Server
     ctx := context.Background()
+    
+    // Server
     server := zmq4.NewRep(ctx)
     defer server.Close()
     
@@ -167,7 +69,8 @@ func main() {
         server.Listen("tcp://127.0.0.1:5555")
         for {
             msg, _ := server.Recv()
-            server.Send(zmq4.NewMsgString("Hello " + string(msg.Bytes())))
+            reply := zmq4.NewMsgString("Hello " + string(msg.Bytes()))
+            server.Send(reply)
         }
     }()
     
@@ -177,121 +80,311 @@ func main() {
     
     client.Dial("tcp://127.0.0.1:5555")
     client.Send(zmq4.NewMsgString("World"))
+    
     reply, _ := client.Recv()
-    fmt.Println(string(reply.Bytes())) // Outputs: Hello World
+    fmt.Println(string(reply.Bytes())) // Output: Hello World
 }
 ```
 
-## Development
+### Secure Communication with CURVE
 
-Use the provided Makefile for common development tasks:
+```go
+import "github.com/destiny/zmq4/v25/security/curve"
+
+// Generate key pairs
+serverPublic, serverPrivate, _ := curve.GenerateKeypair()
+clientPublic, clientPrivate, _ := curve.GenerateKeypair()
+
+// Server with CURVE security
+serverSecurity := curve.NewSecurity("", serverPublic, serverPrivate)
+server := zmq4.NewRep(ctx, zmq4.WithSecurity(serverSecurity))
+
+// Client with CURVE security  
+clientSecurity := curve.NewSecurity(serverPublic, clientPublic, clientPrivate)
+client := zmq4.NewReq(ctx, zmq4.WithSecurity(clientSecurity))
+```
+
+## 🌐 High-Level Protocols
+
+### Zyre - Proximity Peer-to-Peer
+
+Zyre enables automatic peer discovery and group messaging for local networks:
+
+```go
+import "github.com/destiny/zmq4/v25/zyre"
+
+// Create node
+node, _ := zyre.NewNode(&zyre.NodeConfig{
+    Name: "my-node",
+    Headers: map[string]string{"service": "chat"},
+})
+
+// Start and join group
+node.Start()
+node.Join("CHAT")
+
+// Send group message
+node.Shout("CHAT", []byte("Hello everyone!"))
+
+// Handle events
+for event := range node.Events() {
+    switch event.Type() {
+    case zyre.EventEnter:
+        fmt.Printf("Peer %s entered\n", event.PeerName())
+    case zyre.EventShout:
+        fmt.Printf("Group message: %s\n", string(event.Msg()))
+    }
+}
+```
+
+### Dafka - Decentralized Streaming
+
+Dafka provides distributed publish-subscribe with persistence and ordering:
+
+```go
+import "github.com/destiny/zmq4/v25/dafka"
+
+// Producer
+producer, _ := dafka.NewProducer("tcp://127.0.0.1:5556")
+producer.SetTopic("events")
+producer.SetPublisherID("publisher-1")
+
+message := dafka.NewMessage("events", []byte("Event data"))
+producer.Publish(message)
+
+// Consumer
+consumer, _ := dafka.NewConsumer("tcp://127.0.0.1:5556")  
+consumer.Subscribe("events")
+
+for msg := range consumer.Messages() {
+    fmt.Printf("Received: %s\n", string(msg.Content()))
+}
+```
+
+### Malamute - Enterprise Messaging
+
+Malamute enables service-oriented architecture with streams and services:
+
+```go
+import "github.com/destiny/zmq4/v25/malamute"
+
+// Broker
+broker, _ := malamute.NewBroker("tcp://*:5555")
+broker.SetVerbose(true)
+go broker.Start()
+
+// Worker providing a service
+worker, _ := malamute.NewWorker("tcp://127.0.0.1:5555", "calculator")
+go func() {
+    for request := range worker.Requests() {
+        result := calculate(request.Content())
+        reply := malamute.NewMessage("result", result)
+        worker.Reply(reply)
+    }
+}()
+
+// Client using the service
+client, _ := malamute.NewClient("tcp://127.0.0.1:5555")
+request := malamute.NewMessage("calculator", []byte("2+2"))
+reply, _ := client.Request(request)
+fmt.Printf("Result: %s\n", string(reply.Content()))
+```
+
+## 🎯 Choosing the Right Pattern
+
+| Pattern | Use Case | Communication |
+|---------|----------|---------------|
+| **REQ/REP** | Client-server, synchronous | 1:1 request-reply |
+| **DEALER/ROUTER** | Async request-reply, load balancing | N:M with routing |
+| **PUB/SUB** | Broadcasting, events | 1:N publish-subscribe |
+| **PUSH/PULL** | Pipeline processing | N:M load distribution |
+| **PAIR** | Exclusive connection | 1:1 bidirectional |
+| **Zyre** | P2P discovery, local networks | N:N proximity-based |
+| **Dafka** | Event streaming, persistence | N:N with ordering |
+| **Malamute** | SOA, enterprise integration | N:M service-oriented |
+| **Majordomo** | Service discovery, reliability | N:M with brokering |
+
+## 🔒 Security
+
+### CURVE Security Protocol
+
+CURVE provides strong security using elliptic curve cryptography:
+
+- **Perfect Forward Secrecy**: Each session uses unique keys
+- **Identity Verification**: Public key authentication
+- **Anti-Replay Protection**: Nonce-based message ordering
+- **Zero-Configuration**: Automatic key exchange
+
+```go
+// Server setup
+serverKeys, _ := curve.GenerateKeypair()
+serverSecurity := curve.NewSecurity("", serverKeys.Public, serverKeys.Private)
+
+// Client setup  
+clientKeys, _ := curve.GenerateKeypair()
+clientSecurity := curve.NewSecurity(serverKeys.Public, clientKeys.Public, clientKeys.Private)
+
+// Use with any socket type
+server := zmq4.NewRep(ctx, zmq4.WithSecurity(serverSecurity))
+client := zmq4.NewReq(ctx, zmq4.WithSecurity(clientSecurity))
+```
+
+## 🧪 Testing
+
+The project includes comprehensive black-box testing for all protocols:
+
+```bash
+# Run all unit tests
+make test-unit
+
+# Test specific protocols
+make test-zyre
+make test-dafka  
+make test-malamute
+
+# Run with coverage
+make test-coverage
+```
+
+### Test Coverage
+- **Zyre Protocol**: 16 test scenarios covering peer discovery, group messaging, events
+- **Dafka Protocol**: 18 test scenarios covering producers, consumers, credit flow control
+- **Malamute Protocol**: 25 test scenarios covering clients, workers, brokers, streams
+
+## 🛠️ Development
+
+### Prerequisites
+- Go 1.19+ 
+- Make (for build automation)
+
+### Build Commands
 
 ```bash
 make help          # Show available targets
-make build         # Build all packages
+make build         # Build all packages  
 make test          # Run tests
 make test-race     # Run tests with race detection
-make lint          # Run linter
-make examples      # Build all examples
+make lint          # Run code quality checks
+make examples      # Build example programs
 ```
 
-## Examples
+### Project Structure
 
-Examples are located in the `example/` directory, each demonstrating different ZeroMQ patterns and features:
+```
+zmq4/
+├── README.md           # This file
+├── zmq4.go            # Core ØMQ implementation
+├── socket_*.go        # Socket type implementations
+├── security/          # Security implementations
+│   ├── curve/        # CURVE security
+│   ├── plain/        # PLAIN authentication  
+│   └── null/         # NULL security
+├── zyre/             # Zyre proximity protocol
+├── dafka/            # Dafka streaming protocol
+├── malamute/         # Malamute enterprise messaging
+├── majordomo/        # Majordomo service pattern
+├── unit_test/        # Comprehensive test suite
+└── example/          # Example programs
+```
+
+## 📚 Examples
+
+Comprehensive examples are provided in the `example/` directory:
 
 ### Basic Patterns
-- `example/hwclient/` - Hello World client (REQ)
-- `example/hwserver/` - Hello World server (REP)
-- `example/rrclient/` - Round-robin client
-- `example/rrworker/` - Round-robin worker
-- `example/rtdealer/` - DEALER pattern example
+- **Hello World**: `example/hwserver/`, `example/hwclient/`
+- **Publish-Subscribe**: `example/psenvpub/`, `example/psenvsub/`
+- **Pipeline**: `example/rtdealer/`
 
-### Publish-Subscribe Pattern
-- `example/psenvpub/` - Publisher with envelope
-- `example/psenvsub/` - Subscriber with envelope
+### Security Examples  
+- **CURVE Security**: `example/curve-server/`, `example/curve-client/`
 
-### Security Examples
-- `example/curve-client/` - CURVE security client
-- `example/curve-server/` - CURVE security server
+### Service Patterns
+- **Majordomo**: `example/mdp-broker/`, `example/mdp-worker/`, `example/mdp-client/`
+- **Secure MDP**: `example/mdp-secure-*/`
 
-### Majordomo Pattern (MDP)
-- `example/mdp-broker/` - MDP broker implementation
-- `example/mdp-client/` - MDP client
-- `example/mdp-worker/` - MDP worker
-
-### Secure Majordomo Pattern
-- `example/mdp-secure-broker/` - MDP broker with CURVE security
-- `example/mdp-secure-client/` - MDP client with CURVE security
-- `example/mdp-secure-worker/` - MDP worker with CURVE security
+### High-Level Protocols
+- **Zyre**: `example/zyre-chat/`, `example/zyre-discovery/`
 
 ### Running Examples
+
 ```bash
 # Basic hello world
-make run-hwserver    # Terminal 1
-make run-hwclient    # Terminal 2
+cd example/hwserver && go run main.go    # Terminal 1
+cd example/hwclient && go run main.go    # Terminal 2
+
+# Secure communication
+cd example/curve-server && go run main.go    # Terminal 1  
+cd example/curve-client && go run main.go    # Terminal 2
 
 # Build all examples
 make examples
 ```
 
-## Security & Compliance
+## 🔧 Advanced Configuration
 
-### RFC Compliance Verification
+### Socket Options
 
-This implementation has been thoroughly tested for RFC compliance:
-
-- **Z85 Encoding (RFC 32)**: 90.5% test coverage, all 12 test cases passed
-- **CURVE Security (RFC 25/26)**: Complete handshake protocol with anti-amplification protection
-- **Majordomo Pattern (RFC 7)**: Full broker/client/worker implementation with proper frame handling
-
-### Security Features
-
-**CURVE Security Implementation**:
-- Complete CURVE handshake protocol (HELLO/WELCOME/INITIATE/READY)
-- Anti-amplification protection with 64-byte zero padding
-- Stateless server operation with cookie mechanism
-- Vouch system for client authentication
-- Proper nonce sequencing (even for client, odd for server)
-- Curve25519 elliptic curve cryptography
-
-**Security Protocols**:
-- CURVE (RFC 25/26) - Elliptic curve cryptography
-- PLAIN - Username/password authentication
-- NULL - No security (default)
-
-### Performance Benchmarks
-
-- **Z85 Encoding**: 15.64 ns/op encode, 41.03 ns/op decode
-- **CURVE Handshake**: Full compatibility with C implementations
-- **Memory Efficiency**: Optimized for production workloads
-- **Test Coverage**: 90.5%+ for core security features
-
-### Interoperability
-
-✅ **Head-to-Head C Compatibility**: Verified to work with C ZeroMQ applications  
-✅ **czmq Integration**: Compatible with existing czmq-based applications  
-✅ **Protocol Compliance**: Passes all RFC compliance tests  
-✅ **Multi-Language Support**: Interoperates with Python, C++, Java ZeroMQ implementations
-
-## Development
-
-Use the provided Makefile for common development tasks:
-
-```bash
-make help          # Show available targets
-make build         # Build all packages
-make test          # Run tests
-make test-race     # Run tests with race detection
-make lint          # Run linter
-make examples      # Build all examples
+```go
+// Configure socket options
+socket := zmq4.NewReq(ctx)
+socket.SetOption(zmq4.OptionSndHWM, 1000)      // Send high water mark
+socket.SetOption(zmq4.OptionRcvHWM, 1000)      // Receive high water mark  
+socket.SetOption(zmq4.OptionLinger, time.Second) // Linger time
+socket.SetOption(zmq4.OptionIdentity, "client-1") // Socket identity
 ```
 
-## License
+### Connection Management
 
-`zmq4` is released under the `Apache 2.0` license.
+```go
+// Multiple connections
+socket := zmq4.NewDealer(ctx)
+socket.Dial("tcp://server1:5555")
+socket.Dial("tcp://server2:5555")
+socket.Dial("tcp://server3:5555")
 
-## Documentation
+// Binding with wildcard
+socket := zmq4.NewRouter(ctx)  
+socket.Listen("tcp://*:5555")        // All interfaces
+socket.Listen("ipc://local.sock")     // Unix domain socket
+```
 
-Documentation for `zmq4` is served by [GoDoc](https://godoc.org/github.com/destiny/zmq4/v25).
+## 🤝 Contributing
 
+We welcome contributions! Please see our contributing guidelines:
 
+1. **Fork** the repository
+2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
+3. **Write** tests for new functionality
+4. **Ensure** all tests pass (`make test`)
+5. **Commit** changes (`git commit -m 'Add amazing feature'`)
+6. **Push** to branch (`git push origin feature/amazing-feature`)  
+7. **Open** a Pull Request
+
+### Code Quality Standards
+- All code must be tested with black-box testing approach
+- Follow Go conventions and best practices
+- Add comprehensive documentation for public APIs
+- Maintain backward compatibility
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- **ØMQ Community**: For the excellent messaging patterns and protocols
+- **Go Community**: For the powerful language and ecosystem
+- **Contributors**: Thank you for making this project better
+
+## 📖 Further Reading
+
+- [ØMQ Guide](http://zguide.zeromq.org/) - Comprehensive ØMQ patterns guide
+- [CURVE Security RFC](https://rfc.zeromq.org/spec/25/) - CURVE security specification  
+- [Majordomo Pattern RFC](https://rfc.zeromq.org/spec/7/) - Service-oriented messaging
+- [Zyre Protocol RFC](https://rfc.zeromq.org/spec/36/) - Proximity networking
+- [GoDoc Documentation](https://godoc.org/github.com/destiny/zmq4/v25) - Complete API reference
+
+---
+
+**ZMQ4** - Bringing the power of ØMQ to the Go ecosystem with reliability, security, and ease of use.
